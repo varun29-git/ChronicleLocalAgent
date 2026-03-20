@@ -68,7 +68,12 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
             if not article_text:
                 continue
 
-            source_digest = summarize_source(brief, plan, result, article_text)
+            try:
+                source_digest = summarize_source(brief, plan, result, article_text)
+            except Exception as exc:
+                print(f"  Skipped source: summary failed: {exc}")
+                continue
+
             source_record = {
                 "query": query,
                 "rank_index": rank,
@@ -122,7 +127,12 @@ Rules:
 <start_of_turn>model
 {{"title":"""
 
-    plan = generate_json_from_prompt(prompt, '{"title":', 220)
+    plan = generate_json_from_prompt(
+        prompt,
+        '{"title":',
+        220,
+        schema_hint='{"title":"str","audience":"str","tone":"str","queries":["q1","q2"],"sections":["s1","s2","s3"]}',
+    )
     queries = [str(item).strip() for item in plan.get("queries", []) if str(item).strip()]
     sections = [str(item).strip() for item in plan.get("sections", []) if str(item).strip()]
     if len(queries) < query_limit:
@@ -284,7 +294,12 @@ Rules:
 <start_of_turn>model
 {{"summary":"""
 
-    data = generate_json_from_prompt(prompt, '{"summary":', 220)
+    data = generate_json_from_prompt(
+        prompt,
+        '{"summary":',
+        220,
+        schema_hint='{"summary":"str","relevance":0.0,"key_points":["p1","p2","p3"]}',
+    )
     summary = str(data.get("summary", "")).strip()
     if not summary:
         raise ValueError("Empty source summary")
@@ -351,19 +366,123 @@ Requirements:
     return generate_text_from_prompt(prompt, 1200).strip()
 
 
-def generate_json_from_prompt(prompt, prefill, max_tokens):
+def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):
     response = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens)
-    full_str = prefill + response.strip()
-    clean_str = "".join(char for char in full_str if ord(char) >= 32)
-    match = re.search(r"(\{.*\})", clean_str, re.DOTALL)
-    if not match:
-        raise ValueError("Model did not return valid JSON")
-    return json.loads(match.group(1))
+    parsed = try_parse_model_json(response, prefill)
+    if parsed is not None:
+        return parsed
+
+    last_response = response
+    for _ in range(retries):
+        repair_prompt = build_json_repair_prompt(last_response, prefill, schema_hint)
+        repaired_response = generate_text_from_prompt(repair_prompt, max_tokens)
+        parsed = try_parse_model_json(repaired_response, "")
+        if parsed is not None:
+            return parsed
+        last_response = repaired_response
+
+    raise ValueError("Model did not return valid JSON")
 
 
 def generate_text_from_prompt(prompt, max_tokens):
     response = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens)
     return response.strip()
+
+
+def try_parse_model_json(response_text, prefill):
+    candidates = []
+    stripped = strip_code_fences(response_text.strip())
+    if prefill:
+        candidates.append(prefill + stripped)
+    candidates.append(stripped)
+
+    for candidate in candidates:
+        parsed = try_parse_json_candidate(candidate)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def try_parse_json_candidate(text):
+    clean_text_value = "".join(char for char in text if ord(char) >= 32)
+
+    try:
+        return json.loads(clean_text_value)
+    except json.JSONDecodeError:
+        pass
+
+    extracted = extract_json_object(clean_text_value)
+    if not extracted:
+        return None
+
+    try:
+        return json.loads(extracted)
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_json_object(text):
+    start = text.find("{")
+    if start == -1:
+        return ""
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    return ""
+
+
+def strip_code_fences(text):
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def build_json_repair_prompt(response_text, prefill, schema_hint):
+    expected_shape = schema_hint or "Return one valid JSON object."
+    prompt = f"""<start_of_turn>user
+Convert the following model output into one valid JSON object.
+
+Expected JSON shape:
+{expected_shape}
+
+Original output:
+\"\"\"
+{prefill}{response_text.strip()}
+\"\"\"
+
+Rules:
+- return valid JSON only
+- do not include markdown fences
+- do not include explanations
+<end_of_turn>
+<start_of_turn>model
+"""
+    return prompt
 
 
 def save_run(plan, brief):
