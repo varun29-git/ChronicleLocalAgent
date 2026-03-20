@@ -224,19 +224,28 @@ def detect_system_info():
     memory_available_gb = detect_available_memory_gb(system_name)
     is_android = bool(os.environ.get("ANDROID_ROOT") or os.environ.get("TERMUX_VERSION"))
     is_ios = sys.platform == "ios"
+    chip = hardware_info.get("chip_type", "")
+    machine = platform.machine()
+    is_apple_silicon = system_name == "Darwin" and (
+        machine == "arm64" or str(chip).startswith("Apple ")
+    )
+    metal_supported = (
+        display_info.get("spdisplays_metal") == "spdisplays_supported" or is_apple_silicon
+    )
 
     return {
         "system_name": system_name,
         "platform": platform.platform(),
-        "machine": platform.machine(),
-        "chip": hardware_info.get("chip_type", ""),
+        "machine": machine,
+        "chip": chip,
         "hardware_model": hardware_info.get("machine_model", ""),
         "gpu_model": gpu_info["model"],
         "gpu_vendor": gpu_info["vendor"],
         "gpu_memory_gb": gpu_info["memory_gb"],
         "dedicated_gpu": gpu_info["dedicated"],
         "gpu_cores": display_info.get("sppci_cores", ""),
-        "metal_supported": display_info.get("spdisplays_metal") == "spdisplays_supported",
+        "metal_supported": metal_supported,
+        "is_apple_silicon": is_apple_silicon,
         "is_android": is_android,
         "is_ios": is_ios,
         "is_mobile": is_android or is_ios,
@@ -516,7 +525,9 @@ def choose_slice_ratio(device_class, system_info):
 
 
 def choose_runtime_backend(device_class, system_info):
-    if device_class == "macbook" and system_info["metal_supported"]:
+    if device_class == "macbook" and (
+        system_info["metal_supported"] or system_info.get("is_apple_silicon")
+    ):
         return "mlx"
     if device_class in {"midrange_phone", "flagship_phone"}:
         return "mobile_matformer"
@@ -690,18 +701,25 @@ Rules:
 <start_of_turn>model
 {{"title":"""
 
-    plan = generate_json_from_prompt(
-        prompt,
-        '{"title":',
-        220,
-        schema_hint='{"title":"str","audience":"str","tone":"str","queries":["q1","q2"],"sections":["s1","s2","s3"]}',
-    )
+    try:
+        plan = generate_json_from_prompt(
+            prompt,
+            '{"title":',
+            220,
+            schema_hint='{"title":"str","audience":"str","tone":"str","queries":["q1","q2"],"sections":["s1","s2","s3"]}',
+        )
+    except Exception as exc:
+        print(f"Planning fallback activated: {exc}")
+        return build_fallback_research_plan(brief, days, query_limit, depth)
+
     queries = [str(item).strip() for item in plan.get("queries", []) if str(item).strip()]
     sections = [str(item).strip() for item in plan.get("sections", []) if str(item).strip()]
     if len(queries) < query_limit:
-        raise ValueError("Model did not provide enough queries")
+        print("Planning fallback activated: model did not provide enough queries")
+        return build_fallback_research_plan(brief, days, query_limit, depth)
     if not sections:
-        raise ValueError("Model did not provide newsletter sections")
+        print("Planning fallback activated: model did not provide newsletter sections")
+        return build_fallback_research_plan(brief, days, query_limit, depth)
 
     return {
         "title": str(plan.get("title", "")).strip() or "Weekly Newsletter",
@@ -710,6 +728,52 @@ Rules:
         "queries": queries[:query_limit],
         "sections": sections,
     }
+
+
+def build_fallback_research_plan(brief, days, query_limit, depth):
+    normalized_brief = clean_text(brief)
+    query_candidates = [
+        f"{normalized_brief}",
+        f"{normalized_brief} latest developments last {days} days",
+        f"{normalized_brief} key news this week",
+        f"{normalized_brief} analysis and outlook",
+        f"{normalized_brief} expert commentary",
+        f"{normalized_brief} what changed this week",
+    ]
+
+    queries = []
+    seen = set()
+    for query in query_candidates:
+        lowered = query.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        queries.append(query)
+        if len(queries) >= query_limit:
+            break
+
+    sections = [
+        "What happened",
+        "Why it matters",
+        "Key developments",
+        "What to watch next",
+    ]
+
+    return {
+        "title": generate_fallback_title(normalized_brief),
+        "audience": "General readers who want a useful weekly briefing",
+        "tone": DEFAULT_WRITING_STYLE,
+        "queries": queries,
+        "sections": sections[: max(3, min(len(sections), 4 if depth == "high" else 3))],
+    }
+
+
+def generate_fallback_title(brief):
+    words = [word for word in re.split(r"\s+", brief) if word]
+    compact = " ".join(words[:4]).strip()
+    if not compact:
+        return "Weekly Newsletter"
+    return compact.title()
 
 
 def fetch_market_snapshot(brief):
