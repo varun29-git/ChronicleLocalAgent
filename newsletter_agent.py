@@ -20,6 +20,29 @@ DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
 MAX_ARTICLE_CHARS = 8000
 DEFAULT_WRITING_STYLE = "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
+DEPTH_PRESETS = {
+    "low": {
+        "query_limit": 2,
+        "results_per_query": 2,
+        "article_chars": 4000,
+        "summary_tokens": 160,
+        "newsletter_tokens": 900,
+    },
+    "medium": {
+        "query_limit": 4,
+        "results_per_query": 3,
+        "article_chars": 8000,
+        "summary_tokens": 220,
+        "newsletter_tokens": 1200,
+    },
+    "high": {
+        "query_limit": 6,
+        "results_per_query": 5,
+        "article_chars": 12000,
+        "summary_tokens": 320,
+        "newsletter_tokens": 1700,
+    },
+}
 SSL_WARNING_SHOWN = False
 
 print("Loading newsletter brain into RAM")
@@ -32,8 +55,9 @@ def main():
     parser = argparse.ArgumentParser(description="Local newsletter research agent")
     parser.add_argument("--brief", help="Newsletter brief or topic")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
-    parser.add_argument("--queries", type=int, default=DEFAULT_QUERIES)
-    parser.add_argument("--results-per-query", type=int, default=DEFAULT_RESULTS_PER_QUERY)
+    parser.add_argument("--depth", choices=("low", "medium", "high"))
+    parser.add_argument("--queries", type=int)
+    parser.add_argument("--results-per-query", type=int)
     parser.add_argument("--output-dir", default="output/newsletters")
     args = parser.parse_args()
 
@@ -41,39 +65,49 @@ def main():
     if not brief:
         raise ValueError("A newsletter brief is required")
 
+    depth = args.depth or prompt_for_depth()
+    settings = build_research_settings(depth, args.queries, args.results_per_query)
+
     run_newsletter_pipeline(
         brief=brief,
         days=args.days,
-        query_limit=args.queries,
-        results_per_query=args.results_per_query,
+        depth=depth,
+        settings=settings,
         output_dir=args.output_dir,
     )
 
 
-def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_dir):
-    plan = build_research_plan(brief, days, query_limit)
-    run_id = save_run(plan, brief)
+def run_newsletter_pipeline(brief, days, depth, settings, output_dir):
+    plan = build_research_plan(brief, days, settings["query_limit"], depth)
+    run_id = save_run(plan, brief, depth)
     market_snapshot = fetch_market_snapshot(brief)
 
     print("\nPlanning complete.")
     print(f"Title: {plan['title']}")
+    print(f"Research depth: {depth}")
     if market_snapshot:
         print(f"Structured market data collected for {len(market_snapshot)} assets.")
 
     collected_sources = []
     for query in plan["queries"]:
         print(f"\nSearching: {query}")
-        results = search_web(query, results_per_query)
+        results = search_web(query, settings["results_per_query"])
         if not results:
             print("  No search results collected for this query.")
             continue
         for rank, result in enumerate(results, start=1):
-            article_text = fetch_article_text(result["url"])
+            article_text = fetch_article_text(result["url"], settings["article_chars"])
             if not article_text:
                 continue
 
             try:
-                source_digest = summarize_source(brief, plan, result, article_text)
+                source_digest = summarize_source(
+                    brief,
+                    plan,
+                    result,
+                    article_text,
+                    settings["summary_tokens"],
+                )
             except Exception as exc:
                 print(f"  Skipped source: summary failed: {exc}")
                 continue
@@ -104,6 +138,8 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
         collected_sources,
         days,
         market_snapshot,
+        depth,
+        settings["newsletter_tokens"],
     )
     output_path = write_newsletter_file(output_dir, plan["title"], newsletter_markdown)
     update_run_output_path(run_id, output_path)
@@ -112,7 +148,26 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
     print(f"Saved to: {output_path}")
 
 
-def build_research_plan(brief, days, query_limit):
+def build_research_settings(depth, query_limit_override, results_per_query_override):
+    settings = dict(DEPTH_PRESETS[depth])
+    if query_limit_override is not None:
+        settings["query_limit"] = query_limit_override
+    if results_per_query_override is not None:
+        settings["results_per_query"] = results_per_query_override
+    return settings
+
+
+def prompt_for_depth():
+    while True:
+        value = input("Research depth (low/medium/high) [medium]: ").strip().lower()
+        if not value:
+            return "medium"
+        if value in DEPTH_PRESETS:
+            return value
+        print("Please choose low, medium, or high.")
+
+
+def build_research_plan(brief, days, query_limit, depth):
     prompt = f"""<start_of_turn>user
 You are the planning brain for a newsletter agent.
 
@@ -121,6 +176,7 @@ Task:
 - decide what web searches are needed
 - decide what sections the newsletter should have
 - produce a plan for a newsletter covering the last {days} days
+- adjust the breadth of research for {depth} depth
 
 Brief:
 "{brief}"
@@ -132,6 +188,9 @@ Rules:
 - choose exactly {query_limit} focused search queries
 - make the sections useful for a real newsletter
 - keep title concise
+- for low depth, keep the scope tight
+- for medium depth, balance breadth and efficiency
+- for high depth, cover the topic more comprehensively
 - do not include any text outside JSON
 <end_of_turn>
 <start_of_turn>model
@@ -300,7 +359,7 @@ def is_certificate_error(exc):
     return "CERTIFICATE_VERIFY_FAILED" in str(exc)
 
 
-def fetch_article_text(url):
+def fetch_article_text(url, max_article_chars):
     try:
         raw_html = fetch_url(url)
     except Exception:
@@ -313,10 +372,10 @@ def fetch_article_text(url):
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = html.unescape(text)
     text = clean_text(text)
-    return text[:MAX_ARTICLE_CHARS]
+    return text[:max_article_chars]
 
 
-def summarize_source(brief, plan, result, article_text):
+def summarize_source(brief, plan, result, article_text, summary_tokens):
     prompt = f"""<start_of_turn>user
 You are summarizing one web source for a newsletter writer.
 
@@ -355,7 +414,7 @@ Rules:
     data = generate_json_from_prompt(
         prompt,
         '{"summary":',
-        220,
+        summary_tokens,
         schema_hint='{"summary":"str","relevance":0.0,"key_points":["p1","p2","p3"]}',
     )
     summary = str(data.get("summary", "")).strip()
@@ -369,7 +428,7 @@ Rules:
     }
 
 
-def compose_newsletter(brief, plan, collected_sources, days, market_snapshot):
+def compose_newsletter(brief, plan, collected_sources, days, market_snapshot, depth, newsletter_tokens):
     compact_sources = []
     for index, source in enumerate(collected_sources, start=1):
         compact_sources.append(
@@ -407,6 +466,9 @@ House style:
 Coverage window:
 Last {days} days
 
+Research depth:
+{depth}
+
 Planned sections:
 {json.dumps(plan['sections'])}
 
@@ -423,6 +485,9 @@ Requirements:
 - make it readable, analytical, and confident
 - do not sound generic, padded, or corporate
 - make at least one concrete interpretation about what mattered most this week
+- if depth is low, keep it crisp and selective
+- if depth is medium, balance signal and concision
+- if depth is high, go deeper on implications and cross-source synthesis
 - use inline citations like [1], [2]
 - if structured market data is present, cite it as [M1]
 - if structured market data is provided, use the exact percentage moves and prices from it instead of vague descriptions
@@ -435,7 +500,7 @@ Requirements:
 <start_of_turn>model
 """
 
-    return generate_text_from_prompt(prompt, 1200).strip()
+    return generate_text_from_prompt(prompt, newsletter_tokens).strip()
 
 
 def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):
@@ -557,16 +622,17 @@ Rules:
     return prompt
 
 
-def save_run(plan, brief):
+def save_run(plan, brief, depth):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO newsletter_runs (brief, audience, tone, title, queries_json, sections_json)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO newsletter_runs (brief, depth, audience, tone, title, queries_json, sections_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             brief,
+            depth,
             plan["audience"],
             plan["tone"],
             plan["title"],
