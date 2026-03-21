@@ -15,7 +15,12 @@ from datetime import datetime
 
 from newsletter_schema import DB_PATH, initialize_database
 
-DEFAULT_MODEL_PATH = "mlx-community/gemma-3-4b-it-4bit"
+DEFAULT_MLX_MODEL_PATH = "mlx-community/gemma-3-4b-it-4bit"
+DEFAULT_TRANSFORMERS_MODEL_PATH = os.environ.get(
+    "NEWSLETTER_AGENT_MODEL_TRANSFORMERS",
+    os.environ.get("NEWSLETTER_AGENT_MODEL", "google/gemma-2-2b-it"),
+)
+DEFAULT_MODEL_PATH = os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_MLX_MODEL_PATH)
 DEFAULT_DAYS = 7
 DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
@@ -81,8 +86,6 @@ MODEL_PROFILES = {
 INSECURE_SSL_CONTEXT = ssl._create_unverified_context()
 initialize_database()
 
-MLX_GENERATE = None
-MLX_LOAD = None
 MODEL = None
 TOKENIZER = None
 MODEL_RUNTIME = None
@@ -127,8 +130,6 @@ def main():
 
 
 def initialize_model_runtime(device_class_override=None):
-    global MLX_GENERATE
-    global MLX_LOAD
     global MODEL
     global TOKENIZER
     global MODEL_RUNTIME
@@ -144,15 +145,35 @@ def initialize_model_runtime(device_class_override=None):
     runtime_profile = choose_model_profile(system_info, DEVICE_CLASS_OVERRIDE)
 
     print(f"Using model slice: {runtime_profile['slice_label']}")
+    print(f"Using runtime backend: {runtime_profile['runtime_backend']}")
 
-    if runtime_profile["runtime_backend"] != "mlx":
-        raise SystemExit(
-            f"Detected {runtime_profile['device_class']} and selected matformer slice "
-            f"{runtime_profile['slice_label']}. This codebase currently ships only the MLX "
-            f"runtime loader, so non-Mac execution still needs a compatible backend to be added "
-            f"for {runtime_profile['runtime_backend']}."
-        )
+    if runtime_profile["runtime_backend"] == "mlx":
+        backend_runtime = initialize_mlx_runtime(system_info, runtime_profile)
+    elif runtime_profile["runtime_backend"] == "transformers":
+        backend_runtime = initialize_transformers_runtime(runtime_profile)
+    else:
+        raise SystemExit(f"Unsupported runtime backend: {runtime_profile['runtime_backend']}")
 
+    MODEL = backend_runtime["model"]
+    TOKENIZER = backend_runtime["tokenizer"]
+    MODEL_RUNTIME = {
+        "system_info": system_info,
+        "device_class": runtime_profile["device_class"],
+        "profile_name": runtime_profile["profile_name"],
+        "runtime_backend": runtime_profile["runtime_backend"],
+        "slice_ratio": runtime_profile["slice_ratio"],
+        "model_path": runtime_profile["model_path"],
+        "draft_model": backend_runtime.get("draft_model"),
+        "num_draft_tokens": backend_runtime.get("num_draft_tokens", 0),
+        "device": backend_runtime.get("device", "cpu"),
+        "generate_fn": backend_runtime.get("generate_fn"),
+    }
+
+    print("Newsletter agent ready.")
+    return MODEL_RUNTIME
+
+
+def initialize_mlx_runtime(system_info, runtime_profile):
     if not system_info["metal_supported"]:
         raise SystemExit("No Metal-capable Apple device detected. The MLX runtime requires Metal support.")
 
@@ -181,23 +202,83 @@ def initialize_model_runtime(device_class_override=None):
         except Exception as exc:
             print(f"Draft model load failed, continuing without it: {exc}")
 
-    MLX_GENERATE = mlx_generate
-    MLX_LOAD = mlx_load
-    MODEL = model
-    TOKENIZER = tokenizer
-    MODEL_RUNTIME = {
-        "system_info": system_info,
-        "device_class": runtime_profile["device_class"],
-        "profile_name": runtime_profile["profile_name"],
-        "runtime_backend": runtime_profile["runtime_backend"],
-        "slice_ratio": runtime_profile["slice_ratio"],
-        "model_path": runtime_profile["model_path"],
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
         "draft_model": draft_model,
         "num_draft_tokens": runtime_profile["num_draft_tokens"],
+        "device": "metal",
+        "generate_fn": mlx_generate,
     }
 
-    print("Newsletter agent ready.")
-    return MODEL_RUNTIME
+
+def initialize_transformers_runtime(runtime_profile):
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Missing dependency for portable runtime: transformers and torch.\n"
+            "Install them for your platform, then rerun the script.\n"
+            "You can also set NEWSLETTER_AGENT_MODEL_TRANSFORMERS to a local or hub model path."
+        ) from exc
+
+    device = choose_transformers_device(torch)
+    dtype = choose_transformers_dtype(torch, device)
+    print("Loading newsletter brain into RAM")
+
+    tokenizer = AutoTokenizer.from_pretrained(runtime_profile["model_path"])
+    model_kwargs = {}
+    if dtype is not None:
+        model_kwargs["torch_dtype"] = dtype
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            runtime_profile["model_path"],
+            low_cpu_mem_usage=True,
+            **model_kwargs,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            runtime_profile["model_path"],
+            **model_kwargs,
+        )
+
+    model.eval()
+    if device != "cpu":
+        model = model.to(device)
+
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "draft_model": None,
+        "num_draft_tokens": 0,
+        "device": device,
+    }
+
+
+def choose_transformers_device(torch):
+    if torch.cuda.is_available():
+        return "cuda"
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend and mps_backend.is_available():
+        return "mps"
+
+    return "cpu"
+
+
+def choose_transformers_dtype(torch, device):
+    if device == "cuda":
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    if device == "mps":
+        return torch.float16
+    return torch.float32
 
 
 def detect_system_info():
@@ -456,7 +537,7 @@ def detect_available_memory_gb(system_name):
 def choose_model_profile(system_info, device_class_override=None):
     device_class = detect_device_class(system_info, device_class_override)
     slice_ratio = choose_slice_ratio(device_class, system_info)
-    runtime_backend = choose_runtime_backend(device_class, system_info)
+    runtime_backend = choose_runtime_backend(system_info)
 
     if slice_ratio <= 0.25:
         profile_name = "constrained"
@@ -471,7 +552,13 @@ def choose_model_profile(system_info, device_class_override=None):
     profile["runtime_backend"] = runtime_backend
     profile["slice_ratio"] = slice_ratio
     profile["slice_label"] = format_slice_label(slice_ratio)
-    profile["model_path"] = choose_model_path_for_slice(slice_ratio, profile["model_path"])
+    profile["model_path"] = resolve_model_path_for_backend(
+        choose_model_path_for_slice(slice_ratio, profile["model_path"]),
+        runtime_backend,
+    )
+    if runtime_backend != "mlx":
+        profile["draft_model_path"] = ""
+        profile["num_draft_tokens"] = 0
     return profile
 
 
@@ -511,21 +598,33 @@ def choose_slice_ratio(device_class, system_info):
     return 1.00
 
 
-def choose_runtime_backend(device_class, system_info):
-    if device_class == "macbook" and (
-        system_info["metal_supported"] or system_info.get("is_apple_silicon")
+def choose_runtime_backend(system_info):
+    override = os.environ.get("NEWSLETTER_AGENT_BACKEND", "").strip().lower()
+    if override in {"mlx", "transformers"}:
+        return override
+
+    if (
+        system_info["system_name"] == "Darwin"
+        and not system_info.get("is_ios")
+        and (system_info["metal_supported"] or system_info.get("is_apple_silicon"))
     ):
         return "mlx"
-    if device_class in {"midrange_phone", "flagship_phone"}:
-        return "mobile_matformer"
-    if device_class == "gaming_laptop":
-        return "desktop_gpu_matformer"
-    return "desktop_cpu_matformer"
+    return "transformers"
 
 
 def choose_model_path_for_slice(slice_ratio, default_path):
     rounded_ratio = round(slice_ratio, 3)
     return SLICE_MODEL_PATHS.get(rounded_ratio, default_path)
+
+
+def resolve_model_path_for_backend(model_path, runtime_backend):
+    if runtime_backend == "mlx":
+        return model_path
+
+    if str(model_path).startswith("mlx-community/"):
+        return DEFAULT_TRANSFORMERS_MODEL_PATH
+
+    return model_path
 
 
 def format_slice_label(slice_ratio):
@@ -1268,15 +1367,7 @@ Rules:
 
 
 def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):
-    runtime = initialize_model_runtime()
-    response = MLX_GENERATE(
-        MODEL,
-        TOKENIZER,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        draft_model=runtime["draft_model"],
-        num_draft_tokens=runtime["num_draft_tokens"],
-    )
+    response = generate_with_runtime(prompt, max_tokens)
     parsed = try_parse_model_json(response, prefill)
     if parsed is not None:
         return parsed
@@ -1294,16 +1385,49 @@ def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, ret
 
 
 def generate_text_from_prompt(prompt, max_tokens):
+    return generate_with_runtime(prompt, max_tokens).strip()
+
+
+def generate_with_runtime(prompt, max_tokens):
     runtime = initialize_model_runtime()
-    response = MLX_GENERATE(
-        MODEL,
-        TOKENIZER,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        draft_model=runtime["draft_model"],
-        num_draft_tokens=runtime["num_draft_tokens"],
-    )
-    return response.strip()
+
+    if runtime["runtime_backend"] == "mlx":
+        return runtime["generate_fn"](
+            MODEL,
+            TOKENIZER,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            draft_model=runtime["draft_model"],
+            num_draft_tokens=runtime["num_draft_tokens"],
+        ).strip()
+
+    if runtime["runtime_backend"] == "transformers":
+        return generate_with_transformers(prompt, max_tokens, runtime)
+
+    raise RuntimeError(f"Unsupported runtime backend: {runtime['runtime_backend']}")
+
+
+def generate_with_transformers(prompt, max_tokens, runtime):
+    import torch
+
+    encoded = TOKENIZER(prompt, return_tensors="pt")
+    device = runtime.get("device", "cpu")
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+    input_length = encoded["input_ids"].shape[-1]
+    pad_token_id = TOKENIZER.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = TOKENIZER.eos_token_id
+
+    with torch.no_grad():
+        output = MODEL.generate(
+            **encoded,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=pad_token_id,
+        )
+
+    generated = output[0][input_length:]
+    return TOKENIZER.decode(generated, skip_special_tokens=True).strip()
 
 
 def try_parse_model_json(response_text, prefill):
