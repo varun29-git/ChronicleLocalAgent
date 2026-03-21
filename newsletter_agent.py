@@ -21,6 +21,7 @@ DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
 MAX_ARTICLE_CHARS = 8000
 REQUEST_TIMEOUT_SECONDS = 5
+DEFAULT_RAM_RESERVE_GB = float(os.environ.get("NEWSLETTER_AGENT_RAM_RESERVE_GB", "4"))
 DEFAULT_WRITING_STYLE = "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
 SLICE_MODEL_PATHS = {
     0.125: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_12_5", DEFAULT_MODEL_PATH),
@@ -493,15 +494,28 @@ def detect_device_class(system_info, device_class_override=None):
 
 
 def choose_slice_ratio(device_class, system_info):
+    available_gb = system_info.get("memory_available_gb", 0.0) or 0.0
+    reserve_gb = max(DEFAULT_RAM_RESERVE_GB, 1.0)
+
     if device_class == "midrange_phone":
         return 0.125
     if device_class == "flagship_phone":
         return 0.25
     if device_class == "midrange_laptop":
+        if available_gb and available_gb <= reserve_gb + 2:
+            return 0.25
         return 0.50
     if device_class == "macbook":
+        if available_gb and available_gb <= reserve_gb + 2:
+            return 0.25
+        if available_gb and available_gb <= reserve_gb + 4:
+            return 0.50
         return 0.75
     if device_class == "gaming_laptop":
+        if available_gb and available_gb <= reserve_gb + 3:
+            return 0.50
+        if available_gb and available_gb <= reserve_gb + 6:
+            return 0.75
         return 1.00
 
     return 0.25
@@ -560,7 +574,9 @@ def run_newsletter_pipeline(
             continue
         for rank, result in enumerate(results, start=1):
             article_text = fetch_article_text(result["url"], settings["article_chars"])
-            if not article_text:
+            source_text = build_source_text(result, article_text)
+            if not source_text:
+                print("  Skipped source: no article text or search snippet available")
                 continue
 
             try:
@@ -568,7 +584,7 @@ def run_newsletter_pipeline(
                     brief,
                     plan,
                     result,
-                    article_text,
+                    source_text,
                     settings["summary_tokens"],
                 )
             except Exception as exc:
@@ -586,7 +602,20 @@ def run_newsletter_pipeline(
                 "relevance_score": float(source_digest["relevance"]),
             }
             save_source(run_id, source_record)
-            collected_sources.append(source_record)
+            collected_sources.append(
+                {
+                    "query": query,
+                    "rank_index": rank,
+                    "title": result["title"],
+                    "url": result["url"],
+                    "snippet": result["snippet"],
+                    "source_summary": source_digest["summary"],
+                    "relevance_score": float(source_digest["relevance"]),
+                }
+            )
+            del article_text
+            del source_text
+            del source_record
             print(f"  Saved source: {result['title']}")
 
     if not collected_sources:
@@ -821,15 +850,25 @@ def search_web(query, max_results):
     except Exception as exc:
         print(f"  Search fetch failed: {exc}")
         return []
-    matches = re.findall(
+
+    results = []
+    seen_urls = set()
+    link_matches = re.finditer(
         r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         html_text,
         re.IGNORECASE | re.DOTALL,
     )
+    snippet_matches = iter(
+        re.findall(
+            r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|'
+            r'<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
+            html_text,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
 
-    results = []
-    seen_urls = set()
-    for href, raw_title in matches:
+    for match in link_matches:
+        href, raw_title = match.groups()
         resolved_url = normalize_result_url(html.unescape(href))
         if not resolved_url or resolved_url in seen_urls:
             continue
@@ -838,12 +877,19 @@ def search_web(query, max_results):
         if not title:
             continue
 
+        raw_snippet = ""
+        try:
+            snippet_groups = next(snippet_matches)
+            raw_snippet = next((group for group in snippet_groups if group), "")
+        except StopIteration:
+            raw_snippet = ""
+
         seen_urls.add(resolved_url)
         results.append(
             {
                 "title": title,
                 "url": resolved_url,
-                "snippet": "",
+                "snippet": clean_text(html.unescape(raw_snippet)),
             }
         )
         if len(results) >= max_results:
@@ -893,7 +939,8 @@ def read_response(request):
 def fetch_article_text(url, max_article_chars):
     try:
         raw_html = fetch_url(url)
-    except Exception:
+    except Exception as exc:
+        print(f"  Article fetch failed for {url}: {exc}")
         return ""
 
     text = raw_html
@@ -904,6 +951,21 @@ def fetch_article_text(url, max_article_chars):
     text = html.unescape(text)
     text = clean_text(text)
     return text[:max_article_chars]
+
+
+def build_source_text(result, article_text):
+    if article_text:
+        return article_text
+
+    snippet = clean_text(result.get("snippet", ""))
+    if not snippet:
+        return ""
+
+    return clean_text(
+        f'Title: {result.get("title", "")}\n'
+        f'URL: {result.get("url", "")}\n'
+        f'Snippet: {snippet}'
+    )
 
 
 def summarize_source(brief, plan, result, article_text, summary_tokens):
