@@ -83,6 +83,35 @@ class ChronicleHandler(BaseHTTPRequestHandler):
 
             return self.send_json({"job": job}, status=HTTPStatus.ACCEPTED)
 
+        if parsed.path == "/api/research":
+            payload = self.read_json_body()
+            if payload is None:
+                return self.send_json({"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST)
+
+            try:
+                normalized_payload = normalize_generation_payload(payload)
+                research_bundle = collect_research_bundle(normalized_payload)
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            return self.send_json({"research": research_bundle}, status=HTTPStatus.OK)
+
+        if parsed.path == "/api/runs/save":
+            payload = self.read_json_body()
+            if payload is None:
+                return self.send_json({"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST)
+
+            try:
+                run_record = save_browser_issue(payload)
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            return self.send_json({"run": run_record}, status=HTTPStatus.CREATED)
+
         return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format_string, *args):
@@ -244,6 +273,7 @@ def build_status_payload():
             "runs_on_device": True,
         },
         "runtime": runtime,
+        "browser_ai": build_browser_ai_snapshot(),
         "active_job": find_active_job(),
         "run_count": count_runs(),
         "issue_count": count_issues(),
@@ -281,6 +311,17 @@ def build_runtime_snapshot():
     }
 
 
+def build_browser_ai_snapshot():
+    return {
+        "provider": "@huggingface/transformers",
+        "preferred_backend": "webgpu",
+        "fallback_backend": "wasm",
+        "high_tier_model": "onnx-community/Qwen2-0.5B-Instruct-ONNX",
+        "low_tier_model": "onnx-community/SmolLM2-135M-Instruct-ONNX-MHA",
+        "cpu_fallback_model": "onnx-community/SmolLM2-135M-Instruct-ONNX",
+    }
+
+
 def detect_runtime_dependencies(runtime_backend):
     try:
         if runtime_backend == "mlx":
@@ -293,6 +334,119 @@ def detect_runtime_dependencies(runtime_backend):
     except ModuleNotFoundError as exc:
         return False, f"Missing dependency: {exc.name}"
     return False, "Unsupported runtime backend"
+
+
+def collect_research_bundle(payload):
+    settings = newsletter_agent.build_research_settings(
+        payload["depth"],
+        payload["queries"],
+        payload["results_per_query"],
+    )
+    plan = newsletter_agent.build_fallback_research_plan(
+        payload["brief"],
+        payload["days"],
+        settings["query_limit"],
+        payload["depth"],
+    )
+    market_snapshot = newsletter_agent.fetch_market_snapshot(payload["brief"])
+
+    collected_sources = []
+    for query in plan["queries"]:
+        results = newsletter_agent.search_web(query, settings["results_per_query"])
+        for rank_index, result in enumerate(results, start=1):
+            article_text = newsletter_agent.fetch_article_text(result["url"], settings["article_chars"])
+            source_text = newsletter_agent.build_source_text(result, article_text)
+            if not source_text:
+                continue
+
+            collected_sources.append(
+                {
+                    "query": query,
+                    "rank_index": rank_index,
+                    "title": result["title"],
+                    "url": result["url"],
+                    "snippet": result["snippet"],
+                    "article_text": article_text,
+                    "source_text": source_text,
+                }
+            )
+
+    return {
+        "brief": payload["brief"],
+        "days": payload["days"],
+        "depth": payload["depth"],
+        "explanation_style": payload["explanation_style"],
+        "style_instructions": payload["style_instructions"],
+        "plan": plan,
+        "market_snapshot": market_snapshot,
+        "sources": collected_sources,
+    }
+
+
+def save_browser_issue(payload):
+    brief = str(payload.get("brief", "")).strip()
+    title = str(payload.get("title", "")).strip()
+    markdown = str(payload.get("markdown", "")).strip()
+    depth = str(payload.get("depth", "medium")).strip().lower() or "medium"
+    explanation_style = str(payload.get("explanation_style", "concise")).strip().lower() or "concise"
+    style_instructions = str(payload.get("style_instructions", "")).strip()
+
+    if not brief:
+        raise ValueError("A newsletter brief is required.")
+    if not title:
+        raise ValueError("A generated title is required.")
+    if not markdown:
+        raise ValueError("Generated markdown is required.")
+    if depth not in ALLOWED_DEPTHS:
+        raise ValueError("Depth must be low, medium, or high.")
+    if explanation_style not in ALLOWED_STYLES:
+        raise ValueError("Explanation style must be concise, feynman, soc, or custom.")
+
+    queries = payload.get("queries") or []
+    sections = payload.get("sections") or []
+    if not isinstance(queries, list):
+        raise ValueError("Queries must be an array.")
+    if not isinstance(sections, list):
+        raise ValueError("Sections must be an array.")
+
+    plan = {
+        "title": title,
+        "audience": str(payload.get("audience", "")).strip() or "General readers",
+        "tone": str(payload.get("tone", "")).strip() or newsletter_agent.DEFAULT_WRITING_STYLE,
+        "queries": [str(item).strip() for item in queries if str(item).strip()],
+        "sections": [str(item).strip() for item in sections if str(item).strip()],
+    }
+    if not plan["sections"]:
+        plan["sections"] = ["What happened", "Why it matters", "What to watch next"]
+
+    run_id = newsletter_agent.save_run(
+        plan,
+        brief,
+        depth,
+        explanation_style,
+        style_instructions,
+    )
+
+    for source in payload.get("sources") or []:
+        if not source.get("url"):
+            continue
+        newsletter_agent.save_source(
+            run_id,
+            {
+                "query": str(source.get("query", "")).strip(),
+                "rank_index": int(source.get("rank_index", 0) or 0),
+                "title": str(source.get("title", "")).strip() or "Untitled source",
+                "url": str(source.get("url", "")).strip(),
+                "snippet": str(source.get("snippet", "")).strip(),
+                "article_text": str(source.get("article_text", "")).strip(),
+                "source_summary": str(source.get("source_summary", "")).strip(),
+                "relevance_score": float(source.get("relevance_score", 0) or 0),
+            },
+        )
+
+    output_files = newsletter_agent.write_newsletter_files(str(OUTPUT_ROOT), title, markdown)
+    newsletter_agent.update_run_output_path(run_id, output_files["html_path"])
+    return fetch_run_by_id(run_id)
 
 
 def create_generation_job(payload):

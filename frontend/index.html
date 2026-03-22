@@ -60,6 +60,13 @@
           </p>
         </div>
 
+        <div class="browser-ai-strip">
+          <span class="mini-badge" id="browser-ai-badge">Browser AI pending</span>
+          <p class="subcopy" id="browser-ai-copy">
+            Chronicle will prefer WebGPU in the browser, then fall back to WASM when GPU compute is not available.
+          </p>
+        </div>
+
         <div class="stat-grid">
           <article class="stat-card">
             <span class="stat-label">Backend</span>
@@ -186,10 +193,10 @@
 
           <div class="composer-actions">
             <button type="submit" class="primary-button" id="generate-button">
-              Generate on this device
+              Generate with browser AI
             </button>
             <p class="subcopy">
-              Chronicle writes locally, then saves an editable HTML issue and a markdown source file.
+              Chronicle prefers browser WebGPU, falls back to browser WASM on weaker devices, and only uses the backend for research collection and saving outputs.
             </p>
           </div>
         </form>
@@ -209,7 +216,7 @@
             No Chronicle issue is running right now.
           </p>
           <p class="subcopy" id="job-subcopy">
-            When a run starts, this panel will track it and point the preview to the finished issue.
+            When a run starts, Chronicle will research through the backend, draft on the user’s device, and then save the finished issue back to the library.
           </p>
         </div>
 
