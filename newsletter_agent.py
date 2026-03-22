@@ -827,6 +827,11 @@ def run_newsletter_pipeline(
     print("\nNewsletter generated.")
     print(f"Saved editable HTML to: {output_files['html_path']}")
     print(f"Saved markdown source to: {output_files['markdown_path']}")
+    return {
+        "run_id": run_id,
+        "title": plan["title"],
+        "output_files": output_files,
+    }
 
 
 def build_research_settings(depth, query_limit_override, results_per_query_override):
