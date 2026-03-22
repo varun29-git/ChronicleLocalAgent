@@ -821,11 +821,12 @@ def run_newsletter_pipeline(
             custom_style_instructions,
             settings["newsletter_tokens"],
         )
-    output_path = write_newsletter_file(output_dir, plan["title"], newsletter_markdown)
-    update_run_output_path(run_id, output_path)
+    output_files = write_newsletter_files(output_dir, plan["title"], newsletter_markdown)
+    update_run_output_path(run_id, output_files["html_path"])
 
     print("\nNewsletter generated.")
-    print(f"Saved to: {output_path}")
+    print(f"Saved editable HTML to: {output_files['html_path']}")
+    print(f"Saved markdown source to: {output_files['markdown_path']}")
 
 
 def build_research_settings(depth, query_limit_override, results_per_query_override):
@@ -1694,14 +1695,1067 @@ def update_run_output_path(run_id, output_path):
     conn.close()
 
 
-def write_newsletter_file(output_dir, title, markdown):
+def write_newsletter_files(output_dir, title, markdown):
     os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}_{slugify(title)}.md"
-    output_path = os.path.join(output_dir, filename)
-    with open(output_path, "w", encoding="utf-8") as handle:
-        handle.write(markdown + "\n")
-    return output_path
+    created_at = datetime.now()
+    timestamp = created_at.strftime("%Y%m%d_%H%M%S")
+    slug = slugify(title)
+    normalized_markdown = normalize_newsletter_markdown(markdown)
+    markdown_path = os.path.join(output_dir, f"{timestamp}_{slug}.md")
+    html_path = os.path.join(output_dir, f"{timestamp}_{slug}.html")
+
+    with open(markdown_path, "w", encoding="utf-8") as handle:
+        handle.write(normalized_markdown + "\n")
+
+    editable_html = render_editable_newsletter_html(title, normalized_markdown, created_at)
+    with open(html_path, "w", encoding="utf-8") as handle:
+        handle.write(editable_html)
+
+    return {
+        "markdown_path": markdown_path,
+        "html_path": html_path,
+    }
+
+
+def normalize_newsletter_markdown(markdown):
+    normalized = strip_code_fences(str(markdown or "")).replace("\r\n", "\n").strip()
+    return normalized
+
+
+def render_editable_newsletter_html(fallback_title, markdown, created_at):
+    document = parse_newsletter_markdown(markdown, fallback_title)
+    display_title = document["title"] or fallback_title or "Newsletter"
+    standfirst = document["standfirst"] or "Add an opening note that frames the issue with conviction."
+    body_html = render_newsletter_body_html(document["blocks"])
+    sources_html = render_sources_html(document["sources"])
+    edition_label = created_at.strftime("%B %d, %Y")
+    storage_key = f"newsletter-studio::{slugify(display_title)}::{created_at.strftime('%Y%m%d%H%M%S')}"
+    description = html.escape(extract_plain_text(standfirst)[:160], quote=True)
+    safe_title = html.escape(display_title)
+    safe_standfirst = format_inline_markdown(standfirst)
+    download_name = f"{slugify(display_title)}-editable.html"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title}</title>
+  <meta name="description" content="{description}">
+  <style>
+    :root {{
+      --bg: #f3ede4;
+      --paper: rgba(255, 250, 244, 0.88);
+      --paper-strong: #fffaf4;
+      --ink: #17120d;
+      --muted: #6e6153;
+      --accent: #b85c38;
+      --accent-deep: #7f3621;
+      --accent-soft: rgba(184, 92, 56, 0.14);
+      --line: rgba(40, 28, 18, 0.12);
+      --shadow: 0 28px 90px rgba(58, 32, 15, 0.14);
+      --display-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      --ui-font: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      --mono-font: "SFMono-Regular", "Menlo", "Consolas", monospace;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    html {{
+      scroll-behavior: smooth;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(255, 220, 194, 0.9), transparent 34%),
+        radial-gradient(circle at 85% 12%, rgba(201, 112, 67, 0.16), transparent 22%),
+        linear-gradient(180deg, #f8f1e7 0%, #efe5d8 48%, #ecdfd1 100%);
+      font-family: var(--ui-font);
+    }}
+
+    body::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(135deg, rgba(255, 255, 255, 0.28), transparent 40%),
+        repeating-linear-gradient(
+          0deg,
+          rgba(23, 18, 13, 0.02),
+          rgba(23, 18, 13, 0.02) 1px,
+          transparent 1px,
+          transparent 8px
+        );
+      mix-blend-mode: multiply;
+      opacity: 0.42;
+    }}
+
+    .page-shell {{
+      width: min(1280px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 24px 0 72px;
+      position: relative;
+      z-index: 1;
+    }}
+
+    .studio-toolbar {{
+      position: sticky;
+      top: 18px;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 14px 18px;
+      border: 1px solid rgba(255, 255, 255, 0.45);
+      border-radius: 22px;
+      background: rgba(27, 18, 10, 0.78);
+      box-shadow: 0 18px 40px rgba(15, 10, 7, 0.18);
+      backdrop-filter: blur(22px);
+      color: #fff8ef;
+    }}
+
+    .toolbar-copy {{
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      min-width: 220px;
+    }}
+
+    .toolbar-kicker {{
+      font-size: 0.72rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: rgba(255, 248, 239, 0.64);
+    }}
+
+    .toolbar-title {{
+      font-size: 0.98rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }}
+
+    .toolbar-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+
+    .toolbar-button,
+    .toolbar-pill {{
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 14px;
+      font: inherit;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: transform 160ms ease, background 160ms ease, color 160ms ease;
+    }}
+
+    .toolbar-button {{
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff8ef;
+    }}
+
+    .toolbar-button:hover,
+    .toolbar-button:focus-visible {{
+      transform: translateY(-1px);
+      background: rgba(255, 255, 255, 0.2);
+      outline: none;
+    }}
+
+    .toolbar-button.primary {{
+      background: linear-gradient(135deg, #d8794e, #b65333);
+      color: white;
+    }}
+
+    .toolbar-pill {{
+      background: rgba(255, 255, 255, 0.08);
+      color: rgba(255, 248, 239, 0.7);
+      cursor: default;
+    }}
+
+    .studio-grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
+      gap: 28px;
+      margin-top: 28px;
+      align-items: start;
+    }}
+
+    .newsletter-card {{
+      position: relative;
+      overflow: hidden;
+      border-radius: 34px;
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      background:
+        radial-gradient(circle at top right, rgba(255, 227, 205, 0.84), transparent 28%),
+        linear-gradient(180deg, rgba(255, 252, 248, 0.96), rgba(255, 248, 240, 0.94));
+      box-shadow: var(--shadow);
+      animation: rise 480ms ease both;
+    }}
+
+    .newsletter-card::after {{
+      content: "";
+      position: absolute;
+      right: -90px;
+      top: -120px;
+      width: 320px;
+      height: 320px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(216, 121, 78, 0.22), transparent 68%);
+      pointer-events: none;
+    }}
+
+    .hero {{
+      position: relative;
+      padding: 68px 74px 34px;
+    }}
+
+    .hero-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 18px;
+      align-items: center;
+    }}
+
+    .eyebrow,
+    .meta-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-size: 0.76rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }}
+
+    .eyebrow {{
+      background: rgba(255, 255, 255, 0.72);
+      color: var(--accent-deep);
+      border: 1px solid rgba(184, 92, 56, 0.18);
+    }}
+
+    .meta-chip {{
+      background: rgba(24, 18, 13, 0.06);
+      color: rgba(23, 18, 13, 0.65);
+      border: 1px solid rgba(23, 18, 13, 0.08);
+    }}
+
+    .headline {{
+      margin: 0;
+      max-width: 11ch;
+      font-family: var(--display-font);
+      font-size: clamp(3rem, 8vw, 5.9rem);
+      line-height: 0.94;
+      letter-spacing: -0.05em;
+    }}
+
+    .standfirst {{
+      margin: 22px 0 0;
+      max-width: 760px;
+      color: rgba(23, 18, 13, 0.76);
+      font-size: clamp(1.02rem, 1.2vw + 0.8rem, 1.34rem);
+      line-height: 1.75;
+    }}
+
+    .content-shell {{
+      display: grid;
+      gap: 30px;
+      padding: 0 34px 34px;
+    }}
+
+    .story-panel,
+    .sources-panel,
+    .rail-card {{
+      border-radius: 28px;
+      border: 1px solid var(--line);
+      background: var(--paper);
+      backdrop-filter: blur(12px);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.46);
+    }}
+
+    .story-panel {{
+      padding: 42px 40px 44px;
+    }}
+
+    .story-panel p,
+    .story-panel li {{
+      margin: 0 0 1.2em;
+      font-family: var(--display-font);
+      font-size: 1.14rem;
+      line-height: 1.92;
+      color: rgba(23, 18, 13, 0.92);
+    }}
+
+    .story-panel p:last-child,
+    .story-panel li:last-child {{
+      margin-bottom: 0;
+    }}
+
+    .story-panel p:first-child::first-letter {{
+      float: left;
+      margin: 0.12em 0.12em 0 0;
+      font-family: var(--display-font);
+      font-size: 4.7rem;
+      line-height: 0.75;
+      color: var(--accent-deep);
+    }}
+
+    .story-panel h2,
+    .story-panel h3 {{
+      margin: 2.3rem 0 1rem;
+      color: var(--ink);
+      line-height: 1.08;
+    }}
+
+    .story-panel h2 {{
+      font-family: var(--ui-font);
+      font-size: 0.92rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }}
+
+    .story-panel h3 {{
+      font-family: var(--display-font);
+      font-size: 1.8rem;
+      letter-spacing: -0.03em;
+    }}
+
+    .story-panel ul,
+    .story-panel ol {{
+      margin: 0 0 1.5rem;
+      padding-left: 1.3rem;
+    }}
+
+    .story-panel blockquote {{
+      margin: 1.8rem 0;
+      padding: 1rem 1.2rem 1rem 1.4rem;
+      border-left: 4px solid var(--accent);
+      background: rgba(184, 92, 56, 0.06);
+      font-family: var(--display-font);
+      font-size: 1.14rem;
+      color: rgba(23, 18, 13, 0.88);
+    }}
+
+    .story-panel hr {{
+      border: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(23, 18, 13, 0.18), transparent);
+      margin: 2rem 0;
+    }}
+
+    .citation {{
+      display: inline-flex;
+      transform: translateY(-0.1em);
+      margin-left: 0.08em;
+      padding: 0.1em 0.48em;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-deep);
+      font-family: var(--ui-font);
+      font-size: 0.76rem;
+      font-weight: 600;
+      line-height: 1.4;
+      vertical-align: middle;
+    }}
+
+    .insight-card {{
+      margin: 2rem 0;
+      padding: 1.4rem 1.5rem;
+      border-radius: 22px;
+      background:
+        linear-gradient(135deg, rgba(184, 92, 56, 0.12), rgba(255, 255, 255, 0.82)),
+        var(--paper-strong);
+      border: 1px solid rgba(184, 92, 56, 0.18);
+      box-shadow: 0 14px 28px rgba(184, 92, 56, 0.08);
+    }}
+
+    .insight-label {{
+      margin-bottom: 0.55rem;
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent-deep);
+    }}
+
+    .insight-card p {{
+      margin: 0;
+    }}
+
+    .sources-panel {{
+      padding: 34px 34px 36px;
+    }}
+
+    .section-label {{
+      margin: 0 0 8px;
+      color: var(--accent-deep);
+      font-size: 0.74rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }}
+
+    .section-title {{
+      margin: 0 0 20px;
+      font-family: var(--display-font);
+      font-size: clamp(1.9rem, 3vw, 2.5rem);
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }}
+
+    .sources-grid {{
+      display: grid;
+      gap: 14px;
+    }}
+
+    .source-card {{
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 16px;
+      align-items: start;
+      padding: 16px 18px;
+      border-radius: 20px;
+      border: 1px solid rgba(23, 18, 13, 0.08);
+      background: rgba(255, 255, 255, 0.72);
+      color: inherit;
+      text-decoration: none;
+    }}
+
+    .source-ref {{
+      min-width: 52px;
+      padding-top: 2px;
+      color: var(--accent-deep);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }}
+
+    .source-title {{
+      display: block;
+      font-size: 1rem;
+      font-weight: 600;
+      line-height: 1.45;
+      color: var(--ink);
+    }}
+
+    .source-url {{
+      display: inline-block;
+      margin-top: 6px;
+      color: rgba(23, 18, 13, 0.58);
+      font-size: 0.84rem;
+      word-break: break-word;
+    }}
+
+    .sources-empty {{
+      margin: 0;
+      color: rgba(23, 18, 13, 0.56);
+      font-size: 0.98rem;
+      line-height: 1.7;
+    }}
+
+    .rail {{
+      display: grid;
+      gap: 18px;
+      position: sticky;
+      top: 106px;
+    }}
+
+    .rail-card {{
+      padding: 18px 18px 20px;
+    }}
+
+    .rail-card h3 {{
+      margin: 0 0 8px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent-deep);
+    }}
+
+    .rail-card p,
+    .rail-card li {{
+      margin: 0;
+      color: rgba(23, 18, 13, 0.72);
+      font-size: 0.95rem;
+      line-height: 1.7;
+    }}
+
+    .rail-card ul {{
+      margin: 12px 0 0;
+      padding-left: 1.1rem;
+    }}
+
+    .metric {{
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-top: 12px;
+    }}
+
+    .metric strong {{
+      font-family: var(--display-font);
+      font-size: 2.5rem;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }}
+
+    .editable {{
+      outline: none;
+      transition: box-shadow 160ms ease, background 160ms ease;
+    }}
+
+    .editable:focus {{
+      background: rgba(255, 255, 255, 0.58);
+      box-shadow: 0 0 0 3px rgba(184, 92, 56, 0.18);
+      border-radius: 12px;
+    }}
+
+    .status-ok {{
+      color: #ffd9c9;
+    }}
+
+    .toolbar-hint {{
+      color: rgba(255, 248, 239, 0.58);
+      font-size: 0.78rem;
+    }}
+
+    @keyframes rise {{
+      from {{
+        opacity: 0;
+        transform: translateY(14px);
+      }}
+      to {{
+        opacity: 1;
+        transform: translateY(0);
+      }}
+    }}
+
+    @media (max-width: 1040px) {{
+      .studio-grid {{
+        grid-template-columns: 1fr;
+      }}
+
+      .rail {{
+        position: static;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }}
+    }}
+
+    @media (max-width: 760px) {{
+      .page-shell {{
+        width: min(100vw - 16px, 100%);
+        padding-top: 16px;
+      }}
+
+      .studio-toolbar {{
+        top: 10px;
+        padding: 12px;
+        border-radius: 18px;
+      }}
+
+      .hero {{
+        padding: 42px 24px 22px;
+      }}
+
+      .headline {{
+        max-width: none;
+      }}
+
+      .content-shell {{
+        padding: 0 16px 16px;
+      }}
+
+      .story-panel,
+      .sources-panel {{
+        padding: 26px 22px 28px;
+      }}
+    }}
+
+    @media print {{
+      body {{
+        background: white;
+      }}
+
+      body::before,
+      .studio-toolbar,
+      .rail {{
+        display: none !important;
+      }}
+
+      .page-shell {{
+        width: 100%;
+        padding: 0;
+      }}
+
+      .newsletter-card,
+      .story-panel,
+      .sources-panel {{
+        border: none;
+        box-shadow: none;
+        background: white;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="page-shell">
+    <div class="studio-toolbar">
+      <div class="toolbar-copy">
+        <span class="toolbar-kicker">Newsletter Studio</span>
+        <strong class="toolbar-title">{safe_title}</strong>
+      </div>
+      <div class="toolbar-actions">
+        <button class="toolbar-button" type="button" data-command="bold">Bold</button>
+        <button class="toolbar-button" type="button" data-command="italic">Italic</button>
+        <button class="toolbar-button" type="button" data-command="formatBlock" data-value="H2">H2</button>
+        <button class="toolbar-button" type="button" data-command="formatBlock" data-value="BLOCKQUOTE">Quote</button>
+        <button class="toolbar-button" type="button" data-command="insertHorizontalRule">Rule</button>
+        <button class="toolbar-button primary" type="button" data-action="download">Save HTML</button>
+        <button class="toolbar-button" type="button" data-action="print">Print</button>
+        <button class="toolbar-button" type="button" data-action="reset">Reset</button>
+        <span class="toolbar-pill" id="save-status">Draft loaded</span>
+        <span class="toolbar-pill" id="word-count">0 words</span>
+      </div>
+    </div>
+
+    <div class="studio-grid">
+      <article class="newsletter-card" data-editable-root>
+        <header class="hero">
+          <div class="hero-meta">
+            <span class="eyebrow">Ready to publish</span>
+            <span class="meta-chip">{html.escape(edition_label)}</span>
+            <span class="meta-chip">Editable local draft</span>
+          </div>
+          <h1 class="headline editable" contenteditable="true" spellcheck="true">{safe_title}</h1>
+          <p class="standfirst editable" contenteditable="true" spellcheck="true">{safe_standfirst}</p>
+        </header>
+
+        <div class="content-shell">
+          <section class="story-panel editable" contenteditable="true" spellcheck="true" id="story-body">
+{body_html}
+          </section>
+
+          <section class="sources-panel">
+            <p class="section-label">Verification trail</p>
+            <h2 class="section-title editable" contenteditable="true" spellcheck="true">Sources</h2>
+            <div class="sources-grid editable" contenteditable="true" spellcheck="true">
+{sources_html}
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <aside class="rail">
+        <section class="rail-card">
+          <h3>Editing flow</h3>
+          <p>Click anywhere in the headline, dek, body, or sources and edit directly. The page saves your draft in local browser storage.</p>
+        </section>
+        <section class="rail-card">
+          <h3>Publish finish</h3>
+          <p>Use <strong>Save HTML</strong> when the newsletter is ready. Use <strong>Print</strong> for a clean PDF or a quick browser-based export.</p>
+        </section>
+        <section class="rail-card">
+          <h3>Word count</h3>
+          <div class="metric">
+            <strong id="word-count-rail">0</strong>
+            <span>words</span>
+          </div>
+          <p style="margin-top: 12px;">This count updates as you edit the draft.</p>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    (() => {{
+      const editorRoot = document.querySelector("[data-editable-root]");
+      const storyBody = document.getElementById("story-body");
+      const saveStatus = document.getElementById("save-status");
+      const wordCountBadge = document.getElementById("word-count");
+      const wordCountRail = document.getElementById("word-count-rail");
+      const storageKey = {json.dumps(storage_key)};
+      const downloadName = {json.dumps(download_name)};
+      const initialMarkup = editorRoot.innerHTML;
+      let saveTimer = null;
+
+      function countWords(text) {{
+        const trimmed = text.trim();
+        return trimmed ? trimmed.split(/\\s+/).length : 0;
+      }}
+
+      function updateWordCount() {{
+        const total = countWords(storyBody.innerText);
+        wordCountBadge.textContent = `${{total}} words`;
+        wordCountRail.textContent = String(total);
+      }}
+
+      function setStatus(message) {{
+        saveStatus.textContent = message;
+      }}
+
+      function persistDraft() {{
+        try {{
+          localStorage.setItem(storageKey, editorRoot.innerHTML);
+          setStatus("Saved locally");
+        }} catch (error) {{
+          setStatus("Local save unavailable");
+        }}
+        updateWordCount();
+      }}
+
+      function queueSave() {{
+        setStatus("Editing...");
+        window.clearTimeout(saveTimer);
+        saveTimer = window.setTimeout(persistDraft, 250);
+      }}
+
+      function restoreDraft() {{
+        try {{
+          const savedDraft = localStorage.getItem(storageKey);
+          if (savedDraft) {{
+            editorRoot.innerHTML = savedDraft;
+            setStatus("Recovered local draft");
+          }}
+        }} catch (error) {{
+          setStatus("Draft loaded");
+        }}
+      }}
+
+      function downloadHtml() {{
+        const content = "<!DOCTYPE html>\\n" + document.documentElement.outerHTML;
+        const blob = new Blob([content], {{ type: "text/html;charset=utf-8" }});
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = href;
+        link.download = downloadName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(href);
+        setStatus("HTML exported");
+      }}
+
+      function resetDraft() {{
+        editorRoot.innerHTML = initialMarkup;
+        try {{
+          localStorage.removeItem(storageKey);
+        }} catch (error) {{
+          // ignore storage failures during reset
+        }}
+        setStatus("Reset to generated draft");
+        updateWordCount();
+      }}
+
+      document.querySelectorAll("[data-command]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const command = button.dataset.command;
+          const value = button.dataset.value || null;
+          document.execCommand(command, false, value);
+          queueSave();
+        }});
+      }});
+
+      document.querySelectorAll("[data-action]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const action = button.dataset.action;
+          if (action === "download") {{
+            downloadHtml();
+          }} else if (action === "print") {{
+            window.print();
+          }} else if (action === "reset") {{
+            resetDraft();
+          }}
+        }});
+      }});
+
+      editorRoot.addEventListener("input", queueSave);
+      restoreDraft();
+      updateWordCount();
+    }})();
+  </script>
+</body>
+</html>
+"""
+
+
+def parse_newsletter_markdown(markdown, fallback_title):
+    lines = normalize_newsletter_markdown(markdown).splitlines()
+    title = fallback_title.strip() or "Newsletter"
+    blocks = []
+    sources = []
+    paragraph_lines = []
+    list_items = []
+    list_type = None
+    in_sources_section = False
+
+    def flush_paragraph():
+        nonlocal paragraph_lines
+        if not paragraph_lines:
+            return
+        blocks.append(
+            {
+                "type": "paragraph",
+                "text": " ".join(line.strip() for line in paragraph_lines).strip(),
+            }
+        )
+        paragraph_lines = []
+
+    def flush_list():
+        nonlocal list_items
+        nonlocal list_type
+        if not list_items:
+            return
+        blocks.append(
+            {
+                "type": "list",
+                "ordered": list_type == "ordered",
+                "items": list_items[:],
+            }
+        )
+        list_items = []
+        list_type = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+            continue
+
+        title_match = re.match(r"^#\s+(.+)$", stripped)
+        if title_match:
+            flush_paragraph()
+            flush_list()
+            title = extract_plain_text(title_match.group(1)) or title
+            continue
+
+        if is_sources_heading(stripped):
+            flush_paragraph()
+            flush_list()
+            in_sources_section = True
+            continue
+
+        source_match = re.match(r"^\[([^\]]+)\]:\s*(.+)$", stripped)
+        if source_match:
+            flush_paragraph()
+            flush_list()
+            in_sources_section = True
+            sources.append(build_source_entry(source_match.group(1), source_match.group(2)))
+            continue
+
+        if in_sources_section:
+            if sources:
+                sources[-1]["title"] = clean_text(f"{sources[-1]['title']} {stripped}")
+            continue
+
+        heading_match = re.match(r"^(#{2,6})\s+(.+)$", stripped)
+        if heading_match:
+            flush_paragraph()
+            flush_list()
+            blocks.append(
+                {
+                    "type": "heading",
+                    "level": min(max(len(heading_match.group(1)), 2), 3),
+                    "text": heading_match.group(2).strip(),
+                }
+            )
+            continue
+
+        standalone_bold_match = re.match(r"^\*\*(.+?)\*\*$", stripped)
+        if standalone_bold_match:
+            flush_paragraph()
+            flush_list()
+            blocks.append(
+                {
+                    "type": "heading",
+                    "level": 2,
+                    "text": standalone_bold_match.group(1).strip(),
+                }
+            )
+            continue
+
+        unordered_match = re.match(r"^[-*]\s+(.+)$", stripped)
+        if unordered_match:
+            flush_paragraph()
+            item_text = unordered_match.group(1).strip()
+            if list_type not in {None, "unordered"}:
+                flush_list()
+            list_type = "unordered"
+            list_items.append(item_text)
+            continue
+
+        ordered_match = re.match(r"^\d+\.\s+(.+)$", stripped)
+        if ordered_match:
+            flush_paragraph()
+            item_text = ordered_match.group(1).strip()
+            if list_type not in {None, "ordered"}:
+                flush_list()
+            list_type = "ordered"
+            list_items.append(item_text)
+            continue
+
+        if stripped == "---":
+            flush_paragraph()
+            flush_list()
+            blocks.append({"type": "divider"})
+            continue
+
+        if list_items:
+            flush_list()
+        paragraph_lines.append(stripped)
+
+    flush_paragraph()
+    flush_list()
+
+    standfirst = ""
+    if blocks and blocks[0]["type"] == "paragraph":
+        standfirst = blocks.pop(0)["text"]
+
+    return {
+        "title": title,
+        "standfirst": standfirst,
+        "blocks": blocks,
+        "sources": sources,
+    }
+
+
+def is_sources_heading(text):
+    normalized = extract_plain_text(text).lower().rstrip(":")
+    return normalized in {"sources", "final sources"}
+
+
+def build_source_entry(label, content):
+    source_text = clean_text(content)
+    url = ""
+    title = source_text
+    url_match = re.search(r"(https?://\S+)$", source_text)
+    if url_match:
+        url = url_match.group(1).rstrip(").,")
+        title = source_text[: url_match.start()].rstrip(" -:")
+    return {
+        "label": f"[{label}]",
+        "title": title or source_text,
+        "url": url,
+    }
+
+
+def render_newsletter_body_html(blocks):
+    if not blocks:
+        return "            <p>Start writing. This body is directly editable.</p>\n"
+
+    fragments = []
+    for block in blocks:
+        if block["type"] == "heading":
+            tag_name = "h2" if block["level"] <= 2 else "h3"
+            fragments.append(f"            <{tag_name}>{format_inline_markdown(block['text'])}</{tag_name}>")
+            continue
+
+        if block["type"] == "paragraph":
+            insight_match = re.match(r"^\*\*Killer Insight:\*\*\s*(.+)$", block["text"], re.IGNORECASE)
+            if insight_match:
+                fragments.append(
+                    "            <aside class=\"insight-card\">"
+                    "<div class=\"insight-label\">Killer Insight</div>"
+                    f"<p>{format_inline_markdown(insight_match.group(1).strip())}</p>"
+                    "</aside>"
+                )
+            else:
+                fragments.append(f"            <p>{format_inline_markdown(block['text'])}</p>")
+            continue
+
+        if block["type"] == "list":
+            tag_name = "ol" if block["ordered"] else "ul"
+            list_items = "".join(
+                f"<li>{format_inline_markdown(item)}</li>"
+                for item in block["items"]
+            )
+            fragments.append(f"            <{tag_name}>{list_items}</{tag_name}>")
+            continue
+
+        if block["type"] == "divider":
+            fragments.append("            <hr>")
+
+    return "\n".join(fragments) + "\n"
+
+
+def render_sources_html(sources):
+    if not sources:
+        return (
+            "              <p class=\"sources-empty\">"
+            "Add links, citations, or reporting notes here before publishing."
+            "</p>\n"
+        )
+
+    cards = []
+    for source in sources:
+        label = html.escape(source["label"])
+        title = html.escape(source["title"])
+        url = html.escape(source["url"], quote=True)
+        display_url = html.escape(source["url"] or "Add source URL")
+        if source["url"]:
+            card_html = (
+                "              <a class=\"source-card\" "
+                f"href=\"{url}\" target=\"_blank\" rel=\"noreferrer\">"
+                f"<span class=\"source-ref\">{label}</span>"
+                "<span>"
+                f"<span class=\"source-title\">{title}</span>"
+                f"<span class=\"source-url\">{display_url}</span>"
+                "</span>"
+                "</a>"
+            )
+        else:
+            card_html = (
+                "              <div class=\"source-card\">"
+                f"<span class=\"source-ref\">{label}</span>"
+                "<span>"
+                f"<span class=\"source-title\">{title}</span>"
+                f"<span class=\"source-url\">{display_url}</span>"
+                "</span>"
+                "</div>"
+            )
+        cards.append(card_html)
+
+    return "\n".join(cards) + "\n"
+
+
+def format_inline_markdown(text):
+    safe_text = html.escape(text)
+    safe_text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        lambda match: (
+            f'<a href="{html.escape(match.group(2), quote=True)}" target="_blank" '
+            f'rel="noreferrer">{html.escape(match.group(1))}</a>'
+        ),
+        safe_text,
+    )
+    safe_text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe_text)
+    safe_text = re.sub(r"(?<!\*)\*(.+?)\*(?!\*)", r"<em>\1</em>", safe_text)
+    safe_text = re.sub(
+        r"(?<!\w)\[(M?\d+)\]",
+        r'<span class="citation">[\1]</span>',
+        safe_text,
+    )
+    return safe_text
+
+
+def extract_plain_text(text):
+    plain_text = str(text or "")
+    plain_text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", plain_text)
+    plain_text = re.sub(r"[*_`#>\[\]]", "", plain_text)
+    return clean_text(plain_text)
 
 
 def slugify(value):
