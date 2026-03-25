@@ -1,4 +1,4 @@
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.6.0";
 
 const state = {
   runs: [],
@@ -146,34 +146,25 @@ function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
   const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
-  const highTier = hasWebGPU && deviceMemory >= 8 && hardwareConcurrency >= 8;
-  const balancedTier = hasWebGPU;
 
   const candidates = [];
-  if (highTier) {
+  if (hasWebGPU) {
     candidates.push({
       device: "webgpu",
-      model: browserConfig.high_tier_model,
-      label: "WebGPU high tier",
+      model: browserConfig.model,
+      label: "WebGPU",
       maxNewTokens: 900,
       temperature: 0.2,
-    });
-  }
-  if (balancedTier) {
-    candidates.push({
-      device: "webgpu",
-      model: browserConfig.low_tier_model,
-      label: highTier ? "WebGPU balanced fallback" : "WebGPU balanced",
-      maxNewTokens: 640,
-      temperature: 0.2,
+      num_slices: 5,
     });
   }
   candidates.push({
     device: "wasm",
-    model: browserConfig.cpu_fallback_model,
-    label: hasWebGPU ? "WASM CPU fallback" : "WASM universal fallback",
+    model: browserConfig.model,
+    label: hasWebGPU ? "WASM fallback" : "WASM",
     maxNewTokens: 420,
     temperature: 0.25,
+    num_slices: 5,
   });
 
   return {
@@ -242,7 +233,7 @@ function renderBrowserAiStrip(browserConfig, browserCapabilities) {
   } else {
     setBadge(elements.browserAiBadge, "WASM fallback", "is-warm");
     elements.browserAiCopy.textContent =
-      `WebGPU is not available in this browser, so Chronicle will fall back to ${browserConfig.cpu_fallback_model} with browser-side WASM execution. It should still run, but slower.`;
+      `WebGPU is not available in this browser, so Chronicle will fall back to ${browserConfig.model} with browser-side WASM execution. It should still run, but slower.`;
   }
 }
 
@@ -322,6 +313,7 @@ async function ensureBrowserSession() {
       });
       const generator = await pipeline("text-generation", candidate.model, {
         device: candidate.device,
+        model_kwargs: { num_slices: candidate.num_slices }
       });
       state.browserSession = {
         generator,

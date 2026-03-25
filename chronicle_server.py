@@ -316,9 +316,7 @@ def build_browser_ai_snapshot():
         "provider": "@huggingface/transformers",
         "preferred_backend": "webgpu",
         "fallback_backend": "wasm",
-        "high_tier_model": "onnx-community/Qwen2-0.5B-Instruct-ONNX",
-        "low_tier_model": "onnx-community/SmolLM2-135M-Instruct-ONNX-MHA",
-        "cpu_fallback_model": "onnx-community/SmolLM2-135M-Instruct-ONNX",
+        "model": "onnx-community/gemma-3-4b-it-ONNX",
     }
 
 
