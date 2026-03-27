@@ -386,6 +386,8 @@ def collect_research_bundle(payload):
         logs.append(f"Structured market data collected for {len(market_snapshot)} assets.")
 
     collected_sources = []
+    article_fetches = 0
+    max_article_fetches = max(2, min(6, settings["query_limit"] + 1))
     log_stream = ListLogStream(logs)
     with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
         for query in plan["queries"]:
@@ -407,6 +409,22 @@ def collect_research_bundle(payload):
 
                 logs.append(f"  Result {rank_index}: {result['title']}")
                 article_text = ""
+                should_fetch_article = (
+                    settings.get("article_chars", 0) > 0
+                    and article_fetches < max_article_fetches
+                    and rank_index <= 2
+                )
+                if should_fetch_article:
+                    logs.append("  Fetching article text for richer evidence…")
+                    article_text = newsletter_agent.fetch_article_text(
+                        result["url"],
+                        settings["article_chars"],
+                    )
+                    if article_text:
+                        article_fetches += 1
+                        logs.append(f"  Article text captured: {len(article_text)} chars")
+                    else:
+                        logs.append("  Article fetch did not yield usable text. Falling back to snippet evidence.")
                 source_text = newsletter_agent.build_source_text(result, article_text)
                 if not source_text:
                     logs.append("  Skipped source: no article text or search snippet available")

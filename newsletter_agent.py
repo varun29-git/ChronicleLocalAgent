@@ -134,18 +134,18 @@ DEPTH_PRESETS = {
     "medium": {
         "query_limit": 4,
         "results_per_query": 3,
-        "article_chars": 0,
+        "article_chars": 1200,
         "summary_tokens": 120,
         "newsletter_tokens": 620,
-        "research_budget_seconds": 20,
+        "research_budget_seconds": 35,
     },
     "high": {
         "query_limit": 5,
         "results_per_query": 3,
-        "article_chars": 0,
+        "article_chars": 1800,
         "summary_tokens": 160,
         "newsletter_tokens": 760,
-        "research_budget_seconds": 28,
+        "research_budget_seconds": 60,
     },
 }
 MODEL_PROFILES = {
@@ -1617,15 +1617,18 @@ def build_source_text(result, article_text):
     if article_text:
         return article_text
 
+    title = clean_text(result.get("title", ""))
     snippet = clean_text(result.get("snippet", ""))
-    if not snippet:
-        return ""
-
-    return clean_text(
-        f'Title: {result.get("title", "")}\n'
-        f'URL: {result.get("url", "")}\n'
-        f'Snippet: {snippet}'
+    normalized_title = re.sub(
+        r"\b(reuters|ap news|associated press|msn|aol\.com|yahoo!?\s*news|dw\.com|the new york times|al jazeera|national post|toronto star|britannica)\b",
+        " ",
+        title.lower(),
     )
+    normalized_title = clean_text(re.sub(r"[^a-z0-9]+", " ", normalized_title))
+    normalized_snippet = clean_text(re.sub(r"[^a-z0-9]+", " ", snippet.lower()))
+    if snippet and normalized_snippet and normalized_snippet != normalized_title:
+        return clean_text(f"{title}. {snippet}")
+    return title
 
 
 def looks_like_placeholder_article_text(text):
