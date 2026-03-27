@@ -256,7 +256,7 @@ function finishTurnWithError(message) {
 }
 
 async function runBrowserGeneration(payload) {
-  updateTurnStatus("Planning and collecting research…");
+  updateTurnStatus("Fast research stage: planning and Google search…");
   const researchResponse = await fetchJSON("/api/research", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -277,11 +277,12 @@ async function runBrowserGeneration(payload) {
 
   try {
     const aiSession = await ensureBrowserSession();
-    updateTurnStatus(`Drafting locally with ${aiSession.profile.label}…`);
+    updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
     appendLogLines([
       `Loading local model: ${aiSession.profile.label}`,
       `Generation backend: ${aiSession.profile.device.toUpperCase()}`,
       `Generation budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
+      "Generation started. Waiting here is expected until the draft appears.",
     ]);
 
     updateLiveDraft("Drafting locally from the selected evidence…");
@@ -540,10 +541,7 @@ function selectTopSources(sources, limit) {
   sources
     .map((source, index) => ({
       ...source,
-      sourceText: trimText(
-        source.source_text || source.article_text || source.snippet || "",
-        420,
-      ),
+      sourceText: trimText(source.source_text || source.snippet || "", 280),
       relevanceScore: rankSourceForDraft(source, index),
     }))
     .sort((left, right) => right.relevanceScore - left.relevanceScore)
@@ -561,17 +559,11 @@ function selectTopSources(sources, limit) {
 
 function rankSourceForDraft(source, index) {
   let score = 10 - index * 0.15;
-  if (!isIndirectSource(source)) {
-    score += 4;
-  }
-  if (source.article_text) {
+  if (source.snippet) {
     score += 2;
   }
-  if (source.snippet) {
-    score += 1.5;
-  }
   if (source.source_text) {
-    score += Math.min(2, source.source_text.length / 280);
+    score += Math.min(2, source.source_text.length / 220);
   }
   return score;
 }
@@ -942,8 +934,8 @@ function calculateBrowserProfile(config) {
       sliceCount: 1,
       percentage: 100,
       label: "Single bundle",
-      maxNewTokens: config.hasWebGPU ? 420 : 280,
-      generationTimeoutMs: config.hasWebGPU ? 180000 : 120000,
+      maxNewTokens: config.hasWebGPU ? 300 : 220,
+      generationTimeoutMs: config.hasWebGPU ? 90000 : 75000,
       temperature: 0.2,
     };
   }
@@ -962,11 +954,11 @@ function calculateBrowserProfile(config) {
   }
 
   const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 360;
+  let maxNewTokens = 280;
   if (percentage >= 50) {
-    maxNewTokens = 520;
+    maxNewTokens = 380;
   } else if (percentage >= 25) {
-    maxNewTokens = 440;
+    maxNewTokens = 320;
   }
 
   return {
@@ -974,7 +966,7 @@ function calculateBrowserProfile(config) {
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     maxNewTokens,
-    generationTimeoutMs: percentage >= 50 ? 210000 : 150000,
+    generationTimeoutMs: percentage >= 50 ? 110000 : 85000,
     temperature: 0.2,
   };
 }
@@ -1015,8 +1007,8 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     ? `${percentage}% slice (${normalizedSliceCount}/${maxSlices})`
     : "Single bundle";
   const maxNewTokens = device === "webgpu"
-    ? Math.max(320, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 60)
-    : Math.min(280, recommendedProfile.maxNewTokens);
+    ? Math.max(240, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 40)
+    : Math.min(220, recommendedProfile.maxNewTokens);
   const modelOptions = { device };
 
   if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {
@@ -1036,8 +1028,8 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     percentage,
     maxNewTokens,
     generationTimeoutMs: device === "webgpu"
-      ? Math.max(120000, recommendedProfile.generationTimeoutMs - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 15000)
-      : Math.min(120000, recommendedProfile.generationTimeoutMs),
+      ? Math.max(70000, recommendedProfile.generationTimeoutMs - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 10000)
+      : Math.min(70000, recommendedProfile.generationTimeoutMs),
     temperature: recommendedProfile.temperature,
     modelOptions,
   };
