@@ -1595,6 +1595,8 @@ def fetch_article_text(url, max_article_chars):
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = html.unescape(text)
     text = clean_text(text)
+    if looks_like_placeholder_article_text(text):
+        return ""
     return text[:max_article_chars]
 
 
@@ -1611,6 +1613,15 @@ def build_source_text(result, article_text):
         f'URL: {result.get("url", "")}\n'
         f'Snippet: {snippet}'
     )
+
+
+def looks_like_placeholder_article_text(text):
+    normalized = clean_text(text).lower()
+    if not normalized:
+        return True
+    if normalized in {"google news", "bing", "duckduckgo"}:
+        return True
+    return len(normalized) < 120
 
 
 def summarize_source(brief, plan, result, article_text, summary_tokens):
