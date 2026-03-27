@@ -124,7 +124,7 @@ EXPLANATION_STYLE_GUIDANCE = {
 }
 DEPTH_PRESETS = {
     "low": {
-        "query_limit": 1,
+        "query_limit": 2,
         "results_per_query": 2,
         "article_chars": 0,
         "summary_tokens": 100,
@@ -132,20 +132,20 @@ DEPTH_PRESETS = {
         "research_budget_seconds": 12,
     },
     "medium": {
-        "query_limit": 1,
+        "query_limit": 3,
         "results_per_query": 2,
         "article_chars": 0,
         "summary_tokens": 120,
         "newsletter_tokens": 620,
-        "research_budget_seconds": 15,
+        "research_budget_seconds": 18,
     },
     "high": {
-        "query_limit": 2,
+        "query_limit": 4,
         "results_per_query": 3,
         "article_chars": 0,
         "summary_tokens": 160,
         "newsletter_tokens": 760,
-        "research_budget_seconds": 22,
+        "research_budget_seconds": 25,
     },
 }
 MODEL_PROFILES = {

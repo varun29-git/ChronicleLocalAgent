@@ -165,6 +165,7 @@ function startNewTurn(userPrompt) {
     statusNode: appendAssistantMessage("Starting research…"),
     logContainer: appendLogCard(),
     displayedJobLogCount: 0,
+    reasoningNode: null,
     resultNode: null,
     completed: false,
   };
@@ -175,6 +176,7 @@ function startRecoveredTurn() {
     statusNode: appendAssistantMessage("Resuming the current local run…"),
     logContainer: appendLogCard(),
     displayedJobLogCount: 0,
+    reasoningNode: null,
     resultNode: null,
     completed: false,
   };
@@ -248,6 +250,16 @@ function updateLiveDraft(text) {
   scrollThreadToBottom();
 }
 
+function upsertReasoningSummary(text) {
+  const turn = ensureCurrentTurn();
+  if (!turn.reasoningNode) {
+    turn.reasoningNode = appendAssistantMessage(text, "Reasoning summary");
+    return;
+  }
+  turn.reasoningNode.querySelector(".message-body").textContent = text;
+  scrollThreadToBottom();
+}
+
 function finishTurnWithError(message) {
   setGenerateBusy(false);
   stopPolling();
@@ -265,18 +277,30 @@ async function runBrowserGeneration(payload) {
   const research = researchResponse.research;
   appendLogLines(research.logs || buildResearchLogs(research));
   const packet = buildEditorialPacket(research);
-  appendAssistantMessage(buildReasoningSummary(packet), "Reasoning summary");
+  upsertReasoningSummary(buildReasoningSummary(packet, "Evidence selection complete."));
   appendLogLines([
     `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
     `Working thesis: ${packet.workingThesis}`,
     `Coverage gaps: ${packet.coverageGap}`,
   ]);
 
-  let markdown = "";
+  let markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
   let usedFallbackDraft = false;
 
+  updateLiveDraft(markdown);
+  updateTurnStatus("Fast draft prepared. Optional local model refinement is starting now.");
+  appendLogLines([
+    "Fast draft prepared from the selected evidence.",
+    "Loading browser model for optional refinement.",
+  ]);
+  upsertReasoningSummary(buildReasoningSummary(packet, "Loading browser model for refinement."));
+
   try {
-    const aiSession = await ensureBrowserSession();
+    const aiSession = await withTimeout(
+      ensureBrowserSession(),
+      20000,
+      "Browser model loading took too long. Using the fast draft instead.",
+    );
     updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
     appendLogLines([
       `Loading local model: ${aiSession.profile.label}`,
@@ -284,29 +308,32 @@ async function runBrowserGeneration(payload) {
       `Generation budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
       "Generation started. Waiting here is expected until the draft appears.",
     ]);
+    upsertReasoningSummary(buildReasoningSummary(packet, "Generating a polished newsletter draft locally."));
 
-    updateLiveDraft("Drafting locally from the selected evidence…");
-    markdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
+    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
       if (partialText.trim()) {
         updateLiveDraft(partialText.trim());
+        upsertReasoningSummary(
+          buildReasoningSummary(packet, `Generating newsletter locally. Current draft length: ${partialText.trim().length} characters.`),
+        );
       }
     });
+    markdown = finalizeNewsletterMarkdown(stripMarkdownFences(generatedMarkdown), packet);
   } catch (error) {
     appendLogLines([
       `Model drafting failed: ${error.message || "Unknown error"}`,
       "Switching to deterministic drafting from the collected evidence.",
     ]);
-    markdown = renderFallbackNewsletter(packet);
     usedFallbackDraft = true;
+    updateLiveDraft(markdown);
+    upsertReasoningSummary(buildReasoningSummary(packet, "Local model was too slow, so Chronicle is saving the fast evidence-based draft."));
   }
 
-  const normalizedMarkdown = finalizeNewsletterMarkdown(
-    stripMarkdownFences(markdown),
-    packet,
-  );
+  const normalizedMarkdown = finalizeNewsletterMarkdown(markdown, packet);
   const title = extractTitleFromMarkdown(normalizedMarkdown, packet.title);
 
   updateTurnStatus("Saving the newsletter…");
+  upsertReasoningSummary(buildReasoningSummary(packet, "Saving the newsletter files now."));
   appendLogLines([
     usedFallbackDraft
       ? "Deterministic draft complete. Saving issue files…"
@@ -644,14 +671,15 @@ function buildCoverageGap(selectedSources) {
   return "Use the selected sources directly and avoid claims that are not grounded in the retrieved evidence.";
 }
 
-function buildReasoningSummary(packet) {
+function buildReasoningSummary(packet, currentStage = "") {
   return [
     `Focus: ${packet.brief}`,
+    currentStage ? `Current stage: ${currentStage}` : "",
     `Working thesis: ${packet.workingThesis}`,
     `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
     `Key evidence: ${packet.keyEvidence.join(" | ") || "No source headlines yet"}`,
     `Coverage gap: ${packet.coverageGap}`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function finalizeNewsletterMarkdown(markdown, packet) {
