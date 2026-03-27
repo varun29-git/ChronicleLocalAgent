@@ -279,83 +279,55 @@ async function runBrowserGeneration(payload) {
   const packet = buildEditorialPacket(research);
   appendLogLines(buildVisibleProcessLogs(research, packet));
   updateTurnStatus("Source collection complete. Sending the evidence packet to Chronicle's brain.");
-  upsertReasoningSummary(buildReasoningSummary(packet, "Evidence packet prepared. Chronicle is deciding what the issue is really about."));
+  upsertReasoningSummary(buildReasoningSummary(packet, "Source packet prepared. Chronicle is about to form its argument from the web evidence."));
 
-  let markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
+  let markdown = "";
   let usedFallbackDraft = false;
-  let editorialMemo = buildEditorialMemoText(packet.editorialBrief);
 
   updateTurnStatus("Chronicle is preparing the writing pass.");
   appendLogLines([
     "Evidence packet sent to Chronicle's brain.",
-    "Chronicle is turning the research context into a thesis, section plan, and writing approach.",
+    "Chronicle is reviewing the web evidence and forming a single argument.",
     "Loading Chronicle's local brain.",
   ]);
-  upsertReasoningSummary(buildReasoningSummary(packet, "Loading Chronicle's local brain for reasoning and drafting."));
+  upsertReasoningSummary(buildReasoningSummary(packet, "Loading Chronicle's local brain for argument and drafting."));
 
   try {
     const aiSession = await withTimeout(
       ensureBrowserSession(),
       20000,
-      "Browser model loading took too long. Using the fast draft instead.",
+      "Browser model loading took too long. Using Chronicle's backup draft instead.",
     );
-    updateTurnStatus("Local reasoning stage: building the editorial memo before drafting.");
+    updateTurnStatus("Chronicle's brain is reading the source packet and forming the newsletter argument.");
     appendLogLines([
       `Local brain ready: ${aiSession.profile.label}`,
       `Execution mode: ${aiSession.profile.device.toUpperCase()}`,
-      `Reasoning budget: ${Math.round(aiSession.profile.reasoningTimeoutMs / 1000)}s`,
-      "Local model is building an editorial memo from the collected evidence.",
+      `Writing budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
+      `Writing mode: ${packet.explanationStyle}`,
+      "Chronicle is forming the argument directly from the source packet.",
     ]);
-    upsertReasoningSummary(buildReasoningSummary(packet, "Building the local editorial reasoning memo."));
-
-    try {
-      editorialMemo = await generateEditorialMemo(research, packet, aiSession);
-      appendLogLines([
-        "Local reasoning memo complete.",
-        "Chronicle has locked the thesis, writing approach, and section logic.",
-      ]);
-      upsertReasoningSummary(buildReasoningSummary(packet, "Editorial reasoning complete. Drafting is starting now.", editorialMemo));
-    } catch (memoError) {
-      appendLogLines([
-        `Editorial memo fallback: ${memoError.message || "Unknown error"}`,
-        "Using Chronicle's heuristic editorial brief for the drafting pass.",
-      ]);
-      editorialMemo = buildEditorialMemoText(packet.editorialBrief);
-    }
-
     updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
     appendLogLines([
-      `Generation budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
-      "Generation started. Chronicle is now writing the newsletter.",
+      "Generation started. Chronicle is now writing the newsletter from the web evidence.",
     ]);
-    upsertReasoningSummary(buildReasoningSummary(packet, "Generating a polished newsletter draft locally."));
+    upsertReasoningSummary(buildReasoningSummary(packet, "Chronicle is writing the newsletter now."));
 
-    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, editorialMemo, aiSession, (partialText) => {
+    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
       if (partialText.trim()) {
         upsertReasoningSummary(
-          buildReasoningSummary(packet, describeGenerationStage(packet, partialText.trim()), editorialMemo),
+          buildReasoningSummary(packet, describeGenerationStage(packet, partialText.trim())),
         );
       }
     });
-    let cleanedModelDraft = stripMarkdownFences(generatedMarkdown).trim();
-    if (needsNewsletterRewrite(cleanedModelDraft)) {
-      appendLogLines([
-        "Draft quality check flagged repetition or scaffolding language.",
-        "Chronicle is running a rewrite pass for grammar, flow, and style.",
-      ]);
-      upsertReasoningSummary(buildReasoningSummary(packet, "Revising the draft for flow, grammar, and style.", editorialMemo));
-      cleanedModelDraft = stripMarkdownFences(
-        await rewriteNewsletterMarkdown(research, packet, editorialMemo, cleanedModelDraft, aiSession),
-      ).trim();
-    }
-    markdown = finalizeNewsletterMarkdown(cleanedModelDraft, packet);
+    markdown = finalizeNewsletterMarkdown(stripMarkdownFences(generatedMarkdown), packet);
   } catch (error) {
     appendLogLines([
       `Model drafting failed: ${error.message || "Unknown error"}`,
       "Switching to Chronicle's backup drafting path from the collected evidence.",
     ]);
     usedFallbackDraft = true;
-    upsertReasoningSummary(buildReasoningSummary(packet, "Local model was too slow, so Chronicle is saving the backup draft."));
+    markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
+    upsertReasoningSummary(buildReasoningSummary(packet, "Local model was unavailable, so Chronicle built a backup issue from the source packet."));
   }
 
   const normalizedMarkdown = finalizeNewsletterMarkdown(markdown, packet);
@@ -580,25 +552,8 @@ function buildVisibleProcessLogs(research, packet) {
 }
 
 function buildEditorialPacket(research) {
-  const selectedSources = selectTopSources(research.sources || [], 6);
-  const themeTerms = extractThemeTerms(selectedSources, 6);
-  const keyEvidence = selectedSources
-    .slice(0, 3)
-    .map((source) => cleanupSourceTitle(source.title));
-  const workingThesis = buildWorkingThesis(research, selectedSources, themeTerms);
-  const coverageGap = buildCoverageGap(selectedSources);
-  const leadAngle = buildLeadAngle(research, selectedSources, workingThesis);
-  const sectionAngles = buildSectionAngles(research.plan?.sections || [], selectedSources);
-  const closingInsight = buildClosingInsight(themeTerms, coverageGap);
+  const selectedSources = selectTopSources(research.sources || [], research.depth === "high" ? 10 : 8);
   const styleGuidance = buildStyleGuidance(research.explanation_style, research.style_instructions || "");
-  const editorialBrief = buildHeuristicEditorialBrief(
-    research,
-    selectedSources,
-    workingThesis,
-    leadAngle,
-    coverageGap,
-    themeTerms,
-  );
 
   return {
     brief: research.brief,
@@ -613,15 +568,7 @@ function buildEditorialPacket(research) {
     sections: research.plan?.sections || ["What happened", "Why it matters", "What to watch next"],
     marketSnapshot: research.market_snapshot || [],
     selectedSources,
-    themeTerms,
-    keyEvidence,
-    workingThesis,
-    coverageGap,
-    leadAngle,
-    sectionAngles,
-    closingInsight,
     styleGuidance,
-    editorialBrief,
   };
 }
 
@@ -736,17 +683,16 @@ function buildCoverageGap(selectedSources) {
 }
 
 function buildReasoningSummary(packet, currentStage = "", editorialMemo = "") {
-  const editorialPlan = buildEditorialPlanSummary(packet);
-  const reasoningNote = buildVisibleReasoningNote(packet, editorialMemo);
+  void editorialMemo;
   return [
     `Focus: ${packet.brief}`,
     currentStage ? `Current stage: ${currentStage}` : "",
     `Requested mode: ${packet.explanationStyle}`,
-    `Brain objective: turn the evidence into a single defensible newsletter thesis.`,
-    editorialPlan ? `Narrative plan: ${editorialPlan}` : "",
-    reasoningNote ? `Reasoning note: ${reasoningNote}` : "",
+    `Brain objective: use the source packet to form one clear argument and write the newsletter in that mode.`,
+    `Newsletter structure: ${packet.sections.join(" | ")}`,
+    `Reasoning note: ${buildVisibleReasoningNote(packet)}`,
     `Evidence packet: ${packet.selectedSources.length} source(s) selected.`,
-    `Confidence note: ${packet.coverageGap}`,
+    `Confidence note: ${buildCoverageGap(packet.selectedSources)}`,
   ].filter(Boolean).join("\n");
 }
 
@@ -765,29 +711,39 @@ function finalizeNewsletterMarkdown(markdown, packet) {
 }
 
 function renderFallbackNewsletter(packet) {
+  const openingSources = packet.selectedSources.slice(0, 2);
+  const bodySources = packet.selectedSources.slice(2, 5);
   const lines = [
     `# ${packet.title}`,
     "",
-    packet.editorialBrief.coreThesis,
+    `Chronicle could not finish the full local writing pass, so this backup issue is built directly from the collected source packet for ${packet.brief}.`,
     "",
-    packet.editorialBrief.hiddenPattern,
+    openingSources.length
+      ? `The strongest visible signals came from ${openingSources.map((source, index) => `${cleanupSourceTitle(source.title)} [${index + 1}]`).join(" and ")}.`
+      : "The source packet was too thin to support a stronger opening claim.",
     "",
   ];
 
   packet.sections.forEach((sectionName, index) => {
     lines.push(`## ${sectionName}`);
-    lines.push(buildSectionLead(packet, sectionName, index));
-    lines.push("");
-    lines.push(buildSectionParagraph(packet, sectionName, index));
-    lines.push("");
-    lines.push(buildSectionImplication(packet, sectionName, index));
+    if (index === 0 && openingSources.length) {
+      lines.push(
+        `The clearest developments in the source packet point toward ${packet.brief} becoming the center of the story rather than just a passing mention in separate headlines.`
+      );
+    } else if (index === 1 && bodySources.length) {
+      lines.push(
+        `Taken together, the supporting sources suggest that the real value is not any single update, but the way several signals are clustering around the same narrative direction.`
+      );
+    } else {
+      lines.push(
+        `The next thing to watch is whether the same direction holds as new reporting arrives, because headline-level evidence can clarify or collapse quickly.`
+      );
+    }
     lines.push("");
   });
 
   lines.push("## Closing note");
-  lines.push(packet.editorialBrief.killerInsight);
-  lines.push("");
-  lines.push(packet.closingInsight);
+  lines.push("The backup issue should be treated as a clean interim brief, not the fully polished newsletter Chronicle normally aims to produce.");
   lines.push("");
   lines.push(buildSourcesSection(packet));
   return lines.join("\n");
@@ -852,7 +808,7 @@ function buildEditorialMemoText(editorialBrief) {
   ].join(" | ");
 }
 
-function buildVisibleReasoningNote(packet, editorialMemo) {
+function buildVisibleReasoningNote(packet) {
   if (packet.explanationStyle === "soc") {
     return "Chronicle is framing the issue around the right questions first, then answering them in order.";
   }
@@ -862,10 +818,7 @@ function buildVisibleReasoningNote(packet, editorialMemo) {
   if (packet.explanationStyle === "custom" && packet.styleInstructions) {
     return `Chronicle is following the custom writing guidance: ${trimText(packet.styleInstructions, 140)}`;
   }
-  if (editorialMemo) {
-    return "Chronicle has locked the thesis and is now turning it into clean, reader-facing prose.";
-  }
-  return "Chronicle is looking for the hidden pattern that ties the evidence together.";
+  return "Chronicle is turning the source packet into one clean, argument-led newsletter.";
 }
 
 function describeGenerationStage(packet, partialText) {
