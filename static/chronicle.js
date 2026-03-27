@@ -447,10 +447,13 @@ function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
   const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
+  const isMobile = typeof navigator !== "undefined"
+    && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
   const recommendedProfile = calculateBrowserProfile({
     hasWebGPU,
     deviceMemory,
     hardwareConcurrency,
+    isMobile,
     supportsSlicing: Boolean(browserConfig?.supports_slicing),
     maxSlices: Number(browserConfig?.max_slices || 1),
   });
@@ -458,12 +461,14 @@ function detectBrowserCapabilities(browserConfig) {
     hasWebGPU,
     deviceMemory,
     hardwareConcurrency,
+    isMobile,
   });
 
   return {
     hasWebGPU,
     deviceMemory,
     hardwareConcurrency,
+    isMobile,
     recommendedProfile,
     candidates,
   };
@@ -555,9 +560,9 @@ async function generateNewsletterMarkdown(research, aiSession) {
 
 function buildNewsletterPrompt(research) {
   const sourceBundle = research.sources
-    .slice(0, 5)
+    .slice(0, 4)
     .map((source, index) => {
-      const excerpt = trimText(source.source_text || source.article_text || source.snippet || "", 850);
+      const excerpt = trimText(source.source_text || source.article_text || source.snippet || "", 520);
       return [
         `[${index + 1}] ${source.title}`,
         `URL: ${source.url}`,
@@ -614,6 +619,7 @@ ${sourceBundle || "No sources were collected."}
 Requirements:
 - return markdown only
 - start with one H1 title
+- aim for roughly 550 to 800 words
 - write a short opening note with a point of view
 - organize the body around the planned sections using H2 headings
 - keep the writing analytical, premium, and specific
@@ -635,30 +641,30 @@ function calculateBrowserProfile(config) {
       sliceCount: 1,
       percentage: 100,
       label: "Single bundle",
-      maxNewTokens: config.hasWebGPU ? 900 : 520,
+      maxNewTokens: config.hasWebGPU ? 420 : 280,
       temperature: 0.2,
     };
   }
 
   let sliceCount = 1;
-  if (config.hasWebGPU && (config.deviceMemory >= 8 || config.hardwareConcurrency >= 16)) {
-    sliceCount = maxSlices;
-  } else if (config.hasWebGPU && config.deviceMemory >= 8) {
-    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.75));
-  } else if (config.hasWebGPU || config.deviceMemory >= 8 || config.hardwareConcurrency >= 8) {
-    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.5));
-  } else if (config.deviceMemory >= 4) {
-    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.25));
+  if (!config.hasWebGPU) {
+    sliceCount = 1;
+  } else if (config.isMobile) {
+    sliceCount = config.deviceMemory >= 12 ? 2 : 1;
+  } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 16) {
+    sliceCount = Math.min(maxSlices, 4);
+  } else if (config.deviceMemory >= 16 || config.hardwareConcurrency >= 12) {
+    sliceCount = Math.min(maxSlices, 3);
+  } else if (config.deviceMemory >= 8 || config.hardwareConcurrency >= 8) {
+    sliceCount = Math.min(maxSlices, 2);
   }
 
   const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 420;
-  if (percentage >= 75) {
-    maxNewTokens = 900;
-  } else if (percentage >= 50) {
-    maxNewTokens = 720;
+  let maxNewTokens = 360;
+  if (percentage >= 50) {
+    maxNewTokens = 520;
   } else if (percentage >= 25) {
-    maxNewTokens = 560;
+    maxNewTokens = 440;
   }
 
   return {
@@ -706,8 +712,8 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     ? `${percentage}% slice (${normalizedSliceCount}/${maxSlices})`
     : "Single bundle";
   const maxNewTokens = device === "webgpu"
-    ? Math.max(480, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 80)
-    : Math.min(420, recommendedProfile.maxNewTokens);
+    ? Math.max(320, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 60)
+    : Math.min(280, recommendedProfile.maxNewTokens);
   const modelOptions = { device };
 
   if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {

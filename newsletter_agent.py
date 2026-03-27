@@ -8,6 +8,7 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -55,7 +56,57 @@ DEFAULT_RESULTS_PER_QUERY = 3
 MAX_ARTICLE_CHARS = 8000
 REQUEST_TIMEOUT_SECONDS = 5
 DEFAULT_RAM_RESERVE_GB = float(os.environ.get("NEWSLETTER_AGENT_RAM_RESERVE_GB", "4"))
+MAX_NEWSLETTER_RUNTIME_SECONDS = int(
+    float(os.environ.get("NEWSLETTER_AGENT_MAX_RUNTIME_SECONDS", "300"))
+)
 DEFAULT_WRITING_STYLE = "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
+SEARCH_NOISE_WORDS = {
+    "a",
+    "about",
+    "after",
+    "analysis",
+    "and",
+    "around",
+    "before",
+    "change",
+    "changed",
+    "commentary",
+    "day",
+    "days",
+    "development",
+    "developments",
+    "expert",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "key",
+    "last",
+    "latest",
+    "month",
+    "months",
+    "new",
+    "news",
+    "of",
+    "on",
+    "or",
+    "outlook",
+    "recent",
+    "show",
+    "tell",
+    "that",
+    "the",
+    "this",
+    "today",
+    "update",
+    "updates",
+    "week",
+    "what",
+    "with",
+    "why",
+    "yesterday",
+}
 SLICE_MODEL_PATHS = {
     0.125: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_12_5", DEFAULT_MODEL_PATH),
     0.25: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_25", DEFAULT_MODEL_PATH),
@@ -72,23 +123,26 @@ DEPTH_PRESETS = {
     "low": {
         "query_limit": 2,
         "results_per_query": 2,
-        "article_chars": 4000,
-        "summary_tokens": 160,
-        "newsletter_tokens": 900,
+        "article_chars": 2500,
+        "summary_tokens": 120,
+        "newsletter_tokens": 650,
+        "research_budget_seconds": 45,
     },
     "medium": {
-        "query_limit": 4,
+        "query_limit": 3,
         "results_per_query": 3,
-        "article_chars": 8000,
-        "summary_tokens": 220,
-        "newsletter_tokens": 1200,
+        "article_chars": 4500,
+        "summary_tokens": 180,
+        "newsletter_tokens": 850,
+        "research_budget_seconds": 75,
     },
     "high": {
-        "query_limit": 6,
-        "results_per_query": 5,
-        "article_chars": 12000,
-        "summary_tokens": 320,
-        "newsletter_tokens": 1700,
+        "query_limit": 4,
+        "results_per_query": 4,
+        "article_chars": 6500,
+        "summary_tokens": 240,
+        "newsletter_tokens": 1050,
+        "research_budget_seconds": 110,
     },
 }
 MODEL_PROFILES = {
@@ -613,18 +667,19 @@ def detect_device_class(system_info, device_class_override=None):
 
 def choose_slice_ratio(device_class, system_info):
     available_gb = system_info.get("memory_available_gb", 0.0) or 0.0
-    reserve_gb = max(DEFAULT_RAM_RESERVE_GB, 1.0)
+    total_gb = system_info.get("memory_total_gb", 0.0) or 0.0
+    reserve_gb = max(DEFAULT_RAM_RESERVE_GB, total_gb * 0.35, 1.0)
     headroom_gb = max(available_gb - reserve_gb, 0.0) if available_gb else 0.0
 
     if not available_gb:
         return 0.25
     if headroom_gb <= 2:
         return 0.125
-    if headroom_gb <= 4:
+    if headroom_gb <= 5:
         return 0.25
-    if headroom_gb <= 8:
+    if headroom_gb <= 9:
         return 0.50
-    if headroom_gb <= 12:
+    if headroom_gb <= 14:
         return 0.75
     return 1.00
 
@@ -886,22 +941,39 @@ def run_newsletter_pipeline(
     plan = build_research_plan(brief, days, settings["query_limit"], depth)
     run_id = save_run(plan, brief, depth, explanation_style, custom_style_instructions)
     market_snapshot = fetch_market_snapshot(brief)
+    research_budget_seconds = min(
+        int(settings.get("research_budget_seconds", 75)),
+        max(30, MAX_NEWSLETTER_RUNTIME_SECONDS - 120),
+    )
+    research_deadline = time.monotonic() + research_budget_seconds
 
     print("\nPlanning complete.")
     print(f"Title: {plan['title']}")
     print(f"Research depth: {depth}")
     print(f"Explanation style: {explanation_style}")
+    print(f"Research budget: {research_budget_seconds}s")
     if market_snapshot:
         print(f"Structured market data collected for {len(market_snapshot)} assets.")
 
     collected_sources = []
+    research_budget_hit = False
     for query in plan["queries"]:
+        if time.monotonic() >= research_deadline:
+            research_budget_hit = True
+            print("\nResearch budget reached. Drafting with the sources already collected.")
+            break
+
         print(f"\nSearching: {query}")
-        results = search_web(query, settings["results_per_query"])
+        results = search_web(query, settings["results_per_query"], deadline=research_deadline)
         if not results:
             print("  No search results collected for this query.")
             continue
         for rank, result in enumerate(results, start=1):
+            if time.monotonic() >= research_deadline:
+                research_budget_hit = True
+                print("  Research budget reached while processing results.")
+                break
+
             article_text = fetch_article_text(result["url"], settings["article_chars"])
             source_text = build_source_text(result, article_text)
             if not source_text:
@@ -946,6 +1018,9 @@ def run_newsletter_pipeline(
             del source_text
             del source_record
             print(f"  Saved source: {result['title']}")
+
+        if research_budget_hit:
+            break
 
     if not collected_sources:
         print(
@@ -1096,23 +1171,30 @@ Rules:
 
 def build_fallback_research_plan(brief, days, query_limit, depth):
     normalized_brief = clean_text(brief)
+    focus_phrase = derive_search_focus_phrase(normalized_brief)
+    keyword_variants = build_search_query_variants(focus_phrase or normalized_brief)
     query_candidates = [
-        f"{normalized_brief}",
-        f"{normalized_brief} latest developments last {days} days",
-        f"{normalized_brief} key news this week",
-        f"{normalized_brief} analysis and outlook",
-        f"{normalized_brief} expert commentary",
-        f"{normalized_brief} what changed this week",
+        normalized_brief,
+        focus_phrase,
+        f"{focus_phrase} news" if focus_phrase else "",
+        f"{focus_phrase} latest" if focus_phrase else "",
+        f"{focus_phrase} this week" if focus_phrase and days <= 10 else "",
+        f"{focus_phrase} last {days} days" if focus_phrase and days > 10 else "",
+        f"{focus_phrase} analysis" if focus_phrase else "",
+        *keyword_variants,
     ]
 
     queries = []
     seen = set()
     for query in query_candidates:
-        lowered = query.lower()
+        cleaned_query = clean_text(query)
+        if not cleaned_query:
+            continue
+        lowered = cleaned_query.lower()
         if lowered in seen:
             continue
         seen.add(lowered)
-        queries.append(query)
+        queries.append(cleaned_query)
         if len(queries) >= query_limit:
             break
 
@@ -1133,11 +1215,86 @@ def build_fallback_research_plan(brief, days, query_limit, depth):
 
 
 def generate_fallback_title(brief):
-    words = [word for word in re.split(r"\s+", brief) if word]
+    focus_phrase = derive_search_focus_phrase(brief)
+    words = [word for word in re.split(r"\s+", focus_phrase or brief) if word]
     compact = " ".join(words[:4]).strip()
     if not compact:
         return "Weekly Newsletter"
     return compact.title()
+
+
+def derive_search_focus_phrase(text):
+    keywords = extract_search_keywords(text)
+    if keywords:
+        return " ".join(keywords[:4])
+    simplified = clean_text(
+        re.sub(
+            r"\b(what changed in|what changed|tell me about|show me|latest developments|key news|analysis and outlook)\b",
+            " ",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+    return simplified
+
+
+def extract_search_keywords(text):
+    keywords = []
+    seen = set()
+    for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9'.-]*", str(text or "").lower()):
+        normalized = word.strip(".'-")
+        if len(normalized) < 3 or normalized.isdigit():
+            continue
+        if normalized in SEARCH_NOISE_WORDS:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        keywords.append(normalized)
+    return keywords
+
+
+def simplify_search_query(query):
+    simplified = re.sub(
+        r"\b(latest developments?|key news|analysis and outlook|expert commentary|what changed this week|what changed in|what changed|latest|this week|last \d+ days?)\b",
+        " ",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    )
+    return clean_text(simplified)
+
+
+def build_search_query_variants(query):
+    original_query = clean_text(query)
+    simplified_query = simplify_search_query(original_query)
+    keywords = extract_search_keywords(simplified_query or original_query)
+    focus_phrase = " ".join(keywords[:4]) if keywords else simplified_query or original_query
+    last_keyword = keywords[-1] if keywords else ""
+
+    variants = []
+    seen = set()
+
+    def add(candidate):
+        text = clean_text(candidate)
+        if not text:
+            return
+        lowered = text.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        variants.append(text)
+
+    add(original_query)
+    add(simplified_query)
+    if focus_phrase:
+        add(f"{focus_phrase} news")
+        add(f"{focus_phrase} latest")
+        add(f"{focus_phrase} analysis")
+        add(f"{focus_phrase} this week")
+    if last_keyword:
+        add(f"{last_keyword} latest news")
+
+    return variants[:5]
 
 
 def fetch_market_snapshot(brief):
@@ -1188,13 +1345,51 @@ def looks_like_crypto_brief(brief):
     return any(keyword in lowered for keyword in keywords)
 
 
-def search_web(query, max_results):
+def search_web(query, max_results, deadline=None):
+    providers = (
+        ("DuckDuckGo HTML", search_duckduckgo_html),
+        ("DuckDuckGo Lite", search_duckduckgo_lite),
+        ("Bing", search_bing_html),
+    )
+    results = []
+    seen_urls = set()
+    query_variants = build_search_query_variants(query)
+
+    for variant_index, query_variant in enumerate(query_variants, start=1):
+        if deadline and time.monotonic() >= deadline:
+            print("  Search budget reached before all query variants finished.")
+            break
+
+        if variant_index > 1:
+            print(f"  Search retry: {query_variant}")
+
+        for provider_name, provider_fn in providers:
+            if deadline and time.monotonic() >= deadline:
+                print("  Search budget reached while checking providers.")
+                return results[:max_results]
+
+            try:
+                provider_results = provider_fn(query_variant, max_results)
+            except Exception as exc:
+                print(f"  {provider_name} failed: {exc}")
+                continue
+
+            print(f"  {provider_name}: {len(provider_results)} result(s)")
+            for result in provider_results:
+                url = result.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                results.append(result)
+                if len(results) >= max_results:
+                    return results[:max_results]
+
+    return results[:max_results]
+
+
+def search_duckduckgo_html(query, max_results):
     url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    try:
-        html_text = fetch_url(url)
-    except Exception as exc:
-        print(f"  Search fetch failed: {exc}")
-        return []
+    html_text = fetch_url(url)
 
     results = []
     seen_urls = set()
@@ -1218,7 +1413,7 @@ def search_web(query, max_results):
         if not resolved_url or resolved_url in seen_urls:
             continue
 
-        title = clean_text(raw_title)
+        title = clean_text(strip_tags(raw_title))
         if not title:
             continue
 
@@ -1234,7 +1429,73 @@ def search_web(query, max_results):
             {
                 "title": title,
                 "url": resolved_url,
-                "snippet": clean_text(html.unescape(raw_snippet)),
+                "snippet": clean_text(strip_tags(html.unescape(raw_snippet))),
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+def search_duckduckgo_lite(query, max_results):
+    url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
+    html_text = fetch_url(url)
+
+    results = []
+    seen_urls = set()
+    for block in re.findall(r"<tr>.*?</tr>", html_text, re.IGNORECASE | re.DOTALL):
+        link_match = re.search(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+        if not link_match:
+            continue
+
+        href, raw_title = link_match.groups()
+        resolved_url = normalize_result_url(html.unescape(href))
+        if not resolved_url or resolved_url in seen_urls:
+            continue
+
+        snippet_match = re.search(
+            r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        seen_urls.add(resolved_url)
+        results.append(
+            {
+                "title": clean_text(strip_tags(raw_title)),
+                "url": resolved_url,
+                "snippet": clean_text(strip_tags(snippet_match.group(1))) if snippet_match else "",
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+def search_bing_html(query, max_results):
+    url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+    html_text = fetch_url(url)
+
+    results = []
+    seen_urls = set()
+    for block in re.findall(r'<li[^>]*class="b_algo"[^>]*>.*?</li>', html_text, re.IGNORECASE | re.DOTALL):
+        link_match = re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+        if not link_match:
+            continue
+
+        href, raw_title = link_match.groups()
+        resolved_url = normalize_result_url(html.unescape(href))
+        if not resolved_url or resolved_url in seen_urls:
+            continue
+
+        snippet_match = re.search(r"<p>(.*?)</p>", block, re.IGNORECASE | re.DOTALL)
+        seen_urls.add(resolved_url)
+        results.append(
+            {
+                "title": clean_text(strip_tags(raw_title)),
+                "url": resolved_url,
+                "snippet": clean_text(strip_tags(snippet_match.group(1))) if snippet_match else "",
             }
         )
         if len(results) >= max_results:
@@ -1259,6 +1520,11 @@ def normalize_result_url(href):
     return ""
 
 
+def strip_tags(value):
+    without_tags = re.sub(r"(?s)<[^>]+>", " ", str(value or ""))
+    return html.unescape(clean_text(without_tags))
+
+
 def fetch_url(url):
     request = urllib.request.Request(
         url,
@@ -1266,7 +1532,10 @@ def fetch_url(url):
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-            )
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
         },
     )
     return read_response(request)

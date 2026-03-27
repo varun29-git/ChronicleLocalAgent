@@ -367,11 +367,18 @@ def collect_research_bundle(payload):
         payload["depth"],
     )
     market_snapshot = newsletter_agent.fetch_market_snapshot(payload["brief"])
+    research_budget_seconds = min(
+        int(settings.get("research_budget_seconds", 75)),
+        max(30, newsletter_agent.MAX_NEWSLETTER_RUNTIME_SECONDS - 120),
+    )
+    research_deadline = newsletter_agent.time.monotonic() + research_budget_seconds
     logs = [
         "Planning complete.",
         f"Title: {plan['title']}",
         f"Research depth: {payload['depth']}",
         f"Explanation style: {payload['explanation_style']}",
+        "Planner mode: lightweight heuristic planner to preserve RAM before generation.",
+        f"Research budget: {research_budget_seconds}s",
     ]
     if market_snapshot:
         logs.append(f"Structured market data collected for {len(market_snapshot)} assets.")
@@ -380,10 +387,22 @@ def collect_research_bundle(payload):
     log_stream = ListLogStream(logs)
     with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
         for query in plan["queries"]:
+            if newsletter_agent.time.monotonic() >= research_deadline:
+                logs.append("Research budget reached. Drafting with the material already collected.")
+                break
+
             logs.append(f"Searching: {query}")
-            results = newsletter_agent.search_web(query, settings["results_per_query"])
+            results = newsletter_agent.search_web(
+                query,
+                settings["results_per_query"],
+                deadline=research_deadline,
+            )
             logs.append(f"  Search results: {len(results)}")
             for rank_index, result in enumerate(results, start=1):
+                if newsletter_agent.time.monotonic() >= research_deadline:
+                    logs.append("  Research budget reached while processing results.")
+                    break
+
                 logs.append(f"  Result {rank_index}: {result['title']}")
                 article_text = newsletter_agent.fetch_article_text(result["url"], settings["article_chars"])
                 source_text = newsletter_agent.build_source_text(result, article_text)
