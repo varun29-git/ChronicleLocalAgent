@@ -1,105 +1,67 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const state = {
-  runs: [],
-  selectedRunId: null,
-  activeJobId: null,
-  pollTimer: null,
   serverRuntime: null,
   browserConfig: null,
   browserCapabilities: null,
   browserSession: null,
+  activeJobId: null,
+  pollTimer: null,
+  currentTurn: null,
+  hasRenderedIntro: false,
 };
 
 const elements = {};
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheElements();
-  bindSegments();
   bindComposer();
   hydrateApp().catch((error) => {
     console.error(error);
-    renderJobError(error.message || "Chronicle failed to initialize.");
+    appendSystemMessage(error.message || "Chronicle failed to initialize.");
   });
 });
 
 function cacheElements() {
-  elements.runtimeBadge = document.getElementById("runtime-badge");
-  elements.runtimeHeadline = document.getElementById("runtime-headline");
-  elements.runtimeSubline = document.getElementById("runtime-subline");
-  elements.browserAiBadge = document.getElementById("browser-ai-badge");
-  elements.browserAiCopy = document.getElementById("browser-ai-copy");
-  elements.statBackend = document.getElementById("stat-backend");
-  elements.statSlice = document.getElementById("stat-slice");
-  elements.statMemory = document.getElementById("stat-memory");
-  elements.statModelReady = document.getElementById("stat-model-ready");
-  elements.detailHostname = document.getElementById("detail-hostname");
-  elements.detailPlatform = document.getElementById("detail-platform");
-  elements.detailDeviceClass = document.getElementById("detail-device-class");
-  elements.detailModelPath = document.getElementById("detail-model-path");
-  elements.detailModelRoot = document.getElementById("detail-model-root");
-
+  elements.statusPill = document.getElementById("status-pill");
+  elements.statusCopy = document.getElementById("status-copy");
+  elements.chatThread = document.getElementById("chat-thread");
   elements.composerForm = document.getElementById("composer-form");
-  elements.generateButton = document.getElementById("generate-button");
+  elements.brief = document.getElementById("brief");
+  elements.explanationStyle = document.getElementById("explanation-style");
   elements.customStyleField = document.getElementById("custom-style-field");
-
-  elements.jobBadge = document.getElementById("job-badge");
-  elements.jobMessage = document.getElementById("job-message");
-  elements.jobSubcopy = document.getElementById("job-subcopy");
-  elements.jobRunTitle = document.getElementById("job-run-title");
-  elements.jobRunTime = document.getElementById("job-run-time");
-  elements.jobOpenHtml = document.getElementById("job-open-html");
-  elements.jobOpenMd = document.getElementById("job-open-md");
-
-  elements.libraryCount = document.getElementById("library-count");
-  elements.runList = document.getElementById("run-list");
-
-  elements.previewTitle = document.getElementById("preview-title");
-  elements.previewMode = document.getElementById("preview-mode");
-  elements.previewFrame = document.getElementById("preview-frame");
-  elements.previewOpenHtml = document.getElementById("preview-open-html");
-  elements.previewOpenMd = document.getElementById("preview-open-md");
-}
-
-function bindSegments() {
-  document.querySelectorAll("[data-segment]").forEach((segmentGroup) => {
-    const hiddenInput = segmentGroup.parentElement.querySelector('input[type="hidden"]');
-    segmentGroup.querySelectorAll(".segment").forEach((button) => {
-      button.addEventListener("click", () => {
-        segmentGroup.querySelectorAll(".segment").forEach((segment) => {
-          segment.classList.remove("is-active");
-        });
-        button.classList.add("is-active");
-        hiddenInput.value = button.dataset.value;
-        if (hiddenInput.name === "explanation_style") {
-          toggleCustomStyleField(button.dataset.value === "custom");
-        }
-      });
-    });
-  });
+  elements.generateButton = document.getElementById("generate-button");
 }
 
 function bindComposer() {
+  elements.explanationStyle.addEventListener("change", () => {
+    toggleCustomStyleField(elements.explanationStyle.value === "custom");
+  });
+
   elements.composerForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-
     const payload = buildPayload();
-    setGenerateBusy(true);
+    if (!payload.brief) {
+      return;
+    }
+
     stopPolling();
+    startNewTurn(payload.brief);
+    setGenerateBusy(true);
 
     try {
       await runBrowserGeneration(payload);
     } catch (error) {
       console.error(error);
+      appendLogLines([
+        `Browser runtime failed: ${error.message || "Unknown error"}`,
+      ]);
+
       if (canUseServerFallback()) {
-        renderJobState({
-          status: "running",
-          message: "Browser AI unavailable. Falling back to the Chronicle runtime on this device.",
-        });
+        updateTurnStatus("Browser runtime failed. Falling back to the host runtime.");
         await startServerGeneration(payload);
       } else {
-        renderJobError(error.message || "Chronicle could not generate the issue on this device.");
-        setGenerateBusy(false);
+        finishTurnWithError(error.message || "Chronicle could not generate the issue on this device.");
       }
     }
   });
@@ -108,38 +70,377 @@ function bindComposer() {
 function buildPayload() {
   const formData = new FormData(elements.composerForm);
   return {
-    brief: formData.get("brief"),
-    depth: formData.get("depth"),
-    explanation_style: formData.get("explanation_style"),
-    style_instructions: formData.get("style_instructions") || "",
-    days: Number(formData.get("days")),
-    queries: Number(formData.get("queries")),
-    results_per_query: Number(formData.get("results_per_query")),
-    device_class: formData.get("device_class") || "",
+    brief: String(formData.get("brief") || "").trim(),
+    depth: String(formData.get("depth") || "medium").trim(),
+    explanation_style: String(formData.get("explanation_style") || "concise").trim(),
+    style_instructions: String(formData.get("style_instructions") || "").trim(),
+    days: Number(formData.get("days") || 7),
   };
 }
 
 async function hydrateApp() {
   toggleCustomStyleField(false);
-  const [statusResponse, runsResponse] = await Promise.all([
-    fetchJSON("/api/status"),
-    fetchJSON("/api/runs?limit=30"),
-  ]);
+  const statusResponse = await fetchJSON("/api/status");
+  applyStatus(statusResponse);
 
+  if (!state.hasRenderedIntro) {
+    appendAssistantMessage(buildIntroMessage());
+    state.hasRenderedIntro = true;
+  }
+
+  if (statusResponse.active_job) {
+    startRecoveredTurn();
+    setGenerateBusy(true);
+    renderJobState(statusResponse.active_job);
+    startPolling(statusResponse.active_job.id);
+  }
+}
+
+function applyStatus(statusResponse) {
   state.serverRuntime = statusResponse.runtime;
   state.browserConfig = statusResponse.browser_ai;
   state.browserCapabilities = detectBrowserCapabilities(statusResponse.browser_ai);
+  renderHeaderStatus();
+}
 
-  renderRuntime(statusResponse.runtime, statusResponse.browser_ai, state.browserCapabilities);
-  renderRuns(runsResponse.runs || []);
+function renderHeaderStatus() {
+  const runtime = state.serverRuntime;
+  const browserConfig = state.browserConfig;
+  const browserCapabilities = state.browserCapabilities;
+  const browserReady = Boolean(browserConfig?.local_model_ready);
+  const supportsSlicing = Boolean(browserConfig?.supports_slicing);
+  const primaryProfile = browserCapabilities?.candidates?.[0];
 
-  if (statusResponse.active_job) {
-    state.activeJobId = statusResponse.active_job.id;
-    renderJobState(statusResponse.active_job);
-    startPolling(statusResponse.active_job.id);
+  if (browserReady) {
+    setStatusPill(browserCapabilities?.hasWebGPU ? "Browser ready" : "WASM ready", "");
+  } else if (runtime?.dependencies_ready && runtime?.model_ready) {
+    setStatusPill("Server fallback only", "is-warm");
   } else {
-    renderJobIdle();
+    setStatusPill("Runtime incomplete", "is-danger");
   }
+
+  if (browserReady && primaryProfile) {
+    const runtimeMode = browserCapabilities.hasWebGPU ? "WebGPU" : "WASM";
+    const sliceText = supportsSlicing ? primaryProfile.sliceLabel : "single local bundle";
+    elements.statusCopy.textContent =
+      `${browserConfig.display_name} is available locally. Chronicle will use ${runtimeMode} and target ${sliceText} on this device.`;
+  } else if (runtime?.dependencies_ready && runtime?.model_ready) {
+    elements.statusCopy.textContent =
+      "The local browser model is unavailable, but the host runtime can still generate newsletters here.";
+  } else {
+    elements.statusCopy.textContent =
+      "Chronicle could not find a complete local runtime path yet. Add the local model bundle or host fallback model to continue.";
+  }
+}
+
+function buildIntroMessage() {
+  const browserConfig = state.browserConfig;
+  const browserCapabilities = state.browserCapabilities;
+
+  if (browserConfig?.local_model_ready) {
+    const firstCandidate = browserCapabilities?.candidates?.[0];
+    return [
+      "Chronicle is ready.",
+      `Local model: ${browserConfig.display_name || browserConfig.local_model_id}`,
+      firstCandidate ? `Current device target: ${firstCandidate.label}` : "",
+      "Send a brief and I’ll show the full search log while I work.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready) {
+    return "Chronicle is ready through the host runtime. Send a brief and I’ll show the search and drafting log in the chat.";
+  }
+
+  return "Chronicle is online, but the local runtime still needs a complete model path before generation can succeed.";
+}
+
+function startNewTurn(userPrompt) {
+  appendUserMessage(userPrompt);
+  elements.brief.value = "";
+  state.currentTurn = {
+    statusNode: appendAssistantMessage("Starting research…"),
+    logContainer: appendLogCard(),
+    displayedJobLogCount: 0,
+    completed: false,
+  };
+}
+
+function startRecoveredTurn() {
+  state.currentTurn = {
+    statusNode: appendAssistantMessage("Resuming the current local run…"),
+    logContainer: appendLogCard(),
+    displayedJobLogCount: 0,
+    completed: false,
+  };
+}
+
+function updateTurnStatus(text) {
+  const turn = ensureCurrentTurn();
+  const body = turn.statusNode.querySelector(".message-body");
+  body.textContent = text;
+  scrollThreadToBottom();
+}
+
+function appendLogLines(lines) {
+  const turn = ensureCurrentTurn();
+  const fragment = document.createDocumentFragment();
+  (lines || []).forEach((line) => {
+    const text = String(line || "").trim();
+    if (!text) {
+      return;
+    }
+    const row = document.createElement("div");
+    row.className = "log-line";
+    row.textContent = text;
+    fragment.appendChild(row);
+  });
+  turn.logContainer.appendChild(fragment);
+  scrollThreadToBottom();
+}
+
+function appendResultCard(run, markdown) {
+  const turn = ensureCurrentTurn();
+  if (turn.completed) {
+    return;
+  }
+
+  const visibleText = stripMarkdownFences(markdown || "").trim() || run?.title || "Newsletter ready.";
+  const card = document.createElement("article");
+  card.className = "message message--assistant";
+  card.innerHTML = `
+    <div class="message-card result-card">
+      <p class="message-label">Chronicle</p>
+      <div class="message-body"></div>
+      <div class="result-actions">
+        ${run?.html_url ? `<a class="result-link" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML</a>` : ""}
+        ${run?.markdown_url ? `<a class="result-link" href="${escapeHtml(run.markdown_url)}" target="_blank" rel="noreferrer">Open markdown</a>` : ""}
+      </div>
+    </div>
+  `;
+  card.querySelector(".message-body").textContent = visibleText;
+  elements.chatThread.appendChild(card);
+  turn.completed = true;
+  scrollThreadToBottom();
+}
+
+function finishTurnWithError(message) {
+  setGenerateBusy(false);
+  stopPolling();
+  updateTurnStatus("Run failed.");
+  appendSystemMessage(message);
+}
+
+async function runBrowserGeneration(payload) {
+  updateTurnStatus("Planning and collecting research…");
+  const researchResponse = await fetchJSON("/api/research", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const research = researchResponse.research;
+  appendLogLines(research.logs || buildResearchLogs(research));
+
+  const aiSession = await ensureBrowserSession();
+  updateTurnStatus(`Drafting locally with ${aiSession.profile.label}…`);
+  appendLogLines([
+    `Loading local model: ${aiSession.profile.label}`,
+    `Generation backend: ${aiSession.profile.device.toUpperCase()}`,
+  ]);
+
+  const markdown = await generateNewsletterMarkdown(research, aiSession);
+  const normalizedMarkdown = stripMarkdownFences(markdown);
+  const title = extractTitleFromMarkdown(normalizedMarkdown, research.plan.title);
+
+  updateTurnStatus("Saving the newsletter…");
+  appendLogLines(["Draft complete. Saving issue files…"]);
+
+  const saveResponse = await fetchJSON("/api/runs/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      brief: payload.brief,
+      title,
+      markdown: normalizedMarkdown,
+      depth: payload.depth,
+      explanation_style: payload.explanation_style,
+      style_instructions: payload.style_instructions,
+      audience: research.plan.audience,
+      tone: research.plan.tone,
+      queries: research.plan.queries,
+      sections: research.plan.sections,
+      sources: research.sources.map((source) => ({
+        ...source,
+        source_summary: source.source_text,
+        relevance_score: 0.5,
+      })),
+    }),
+  });
+
+  setGenerateBusy(false);
+  updateTurnStatus(`Issue ready: ${saveResponse.run.title}`);
+  appendLogLines([
+    `Saved HTML: ${saveResponse.run.html_path || "Unavailable"}`,
+    `Saved markdown: ${saveResponse.run.markdown_path || "Unavailable"}`,
+  ]);
+  appendResultCard(saveResponse.run, normalizedMarkdown);
+  await refreshStatus();
+}
+
+async function startServerGeneration(payload) {
+  const response = await fetchJSON("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  state.activeJobId = response.job.id;
+  renderJobState(response.job);
+  startPolling(response.job.id);
+}
+
+function renderJobState(job) {
+  if (!job) {
+    return;
+  }
+
+  if (job.status === "queued" || job.status === "running") {
+    setGenerateBusy(true);
+  }
+  updateTurnStatus(job.message || "Chronicle is working…");
+  appendJobLogs(job);
+
+  if (job.status === "failed") {
+    finishTurnWithError(job.error?.message || job.message || "Chronicle failed to finish the run.");
+    return;
+  }
+
+  if (job.status === "completed") {
+    setGenerateBusy(false);
+    stopPolling();
+    if (job.result) {
+      appendResultCard(job.result, "");
+    }
+    refreshStatus().catch(console.error);
+  }
+}
+
+function appendJobLogs(job) {
+  const turn = ensureCurrentTurn();
+  const logs = job.logs || [];
+  const newLines = logs.slice(turn.displayedJobLogCount);
+  if (newLines.length) {
+    appendLogLines(newLines);
+    turn.displayedJobLogCount = logs.length;
+  }
+}
+
+function startPolling(jobId) {
+  state.activeJobId = jobId;
+  stopPolling();
+  state.pollTimer = window.setInterval(async () => {
+    try {
+      const response = await fetchJSON(`/api/jobs/${jobId}`);
+      renderJobState(response.job);
+    } catch (error) {
+      finishTurnWithError(error.message || "Chronicle lost contact with the local server.");
+    }
+  }, 1500);
+}
+
+function stopPolling() {
+  if (state.pollTimer) {
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
+async function refreshStatus() {
+  const statusResponse = await fetchJSON("/api/status");
+  applyStatus(statusResponse);
+}
+
+function canUseServerFallback() {
+  return Boolean(state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready);
+}
+
+function ensureCurrentTurn() {
+  if (!state.currentTurn) {
+    startRecoveredTurn();
+  }
+  return state.currentTurn;
+}
+
+function appendUserMessage(text) {
+  return appendMessage("user", text);
+}
+
+function appendAssistantMessage(text) {
+  return appendMessage("assistant", text);
+}
+
+function appendSystemMessage(text) {
+  return appendMessage("system", text);
+}
+
+function appendMessage(role, text) {
+  const article = document.createElement("article");
+  article.className = `message message--${role}`;
+  article.innerHTML = `
+    <div class="message-card">
+      <div class="message-body"></div>
+    </div>
+  `;
+  article.querySelector(".message-body").textContent = text;
+  elements.chatThread.appendChild(article);
+  scrollThreadToBottom();
+  return article;
+}
+
+function appendLogCard() {
+  const article = document.createElement("article");
+  article.className = "message message--assistant";
+  article.innerHTML = `
+    <div class="message-card log-card">
+      <p class="message-label">Search log</p>
+      <div class="log-list"></div>
+    </div>
+  `;
+  elements.chatThread.appendChild(article);
+  scrollThreadToBottom();
+  return article.querySelector(".log-list");
+}
+
+function setGenerateBusy(isBusy) {
+  elements.generateButton.disabled = isBusy;
+  elements.generateButton.textContent = isBusy ? "Working…" : "Send";
+}
+
+function toggleCustomStyleField(visible) {
+  elements.customStyleField.classList.toggle("is-hidden", !visible);
+}
+
+function setStatusPill(text, modifierClass) {
+  elements.statusPill.textContent = text;
+  elements.statusPill.classList.remove("is-warm", "is-danger");
+  if (modifierClass) {
+    elements.statusPill.classList.add(modifierClass);
+  }
+}
+
+function scrollThreadToBottom() {
+  elements.chatThread.scrollTop = elements.chatThread.scrollHeight;
+}
+
+function buildResearchLogs(research) {
+  const logs = [
+    "Planning complete.",
+    `Title: ${research.plan?.title || "Untitled"}`,
+  ];
+  (research.plan?.queries || []).forEach((query) => {
+    logs.push(`Searching: ${query}`);
+  });
+  return logs;
 }
 
 function detectBrowserCapabilities(browserConfig) {
@@ -168,147 +469,8 @@ function detectBrowserCapabilities(browserConfig) {
   };
 }
 
-function renderRuntime(runtime, browserConfig, browserCapabilities) {
-  const dependenciesReady = Boolean(runtime.dependencies_ready);
-  const modelReady = Boolean(runtime.model_ready);
-  const browserModelReady = Boolean(browserConfig.local_model_ready);
-  if (browserModelReady && (!dependenciesReady || !modelReady)) {
-    setBadge(elements.runtimeBadge, "Browser ready", "");
-  } else if (!dependenciesReady) {
-    setBadge(elements.runtimeBadge, "Deps missing", "is-danger");
-  } else if (!modelReady) {
-    setBadge(elements.runtimeBadge, "Model missing", "is-warm");
-  } else {
-    setBadge(elements.runtimeBadge, "Server ready", "");
-  }
-
-  elements.runtimeHeadline.textContent =
-    `Chronicle is using ${runtime.hostname} as the local device anchor.`;
-  if (browserModelReady && (!dependenciesReady || !modelReady)) {
-    elements.runtimeSubline.textContent =
-      "The local browser model bundle is ready and does not require any Hugging Face login. The native server runtime on this host is optional and only used as a fallback when it is fully installed.";
-  } else if (!dependenciesReady) {
-    elements.runtimeSubline.textContent =
-      `${runtime.dependency_message}. The browser AI path can still run if the user’s browser supports it, but native runtime fallback on this machine is not ready yet.`;
-  } else if (!modelReady) {
-    elements.runtimeSubline.textContent =
-      "The server-side local runtime is alive, but the configured fallback model path is missing. Browser AI can still run independently when the local browser bundle is present.";
-  } else {
-    elements.runtimeSubline.textContent =
-      "Both Chronicle modes are available here: the browser loads a local model bundle for cross-device inference, and the native server runtime remains available as a fallback path.";
-  }
-
-  renderBrowserAiStrip(browserConfig, browserCapabilities);
-
-  elements.statBackend.textContent = browserCapabilities.hasWebGPU ? "WEBGPU" : "WASM";
-  elements.statSlice.textContent =
-    browserCapabilities.recommendedProfile?.label || runtime.slice_label || "—";
-  elements.statMemory.textContent =
-    browserCapabilities.deviceMemory > 0
-      ? `${browserCapabilities.deviceMemory.toFixed(1)} GB`
-      : runtime.memory_total_gb
-        ? `${runtime.memory_total_gb.toFixed(1)} GB`
-        : "Unknown";
-  elements.statModelReady.textContent = browserModelReady
-    ? "Local browser ready"
-    : modelReady
-      ? "Fallback ready"
-      : "Model missing";
-
-  elements.detailHostname.textContent = runtime.hostname || "This device";
-  elements.detailPlatform.textContent = [
-    runtime.system_name,
-    runtime.machine,
-    runtime.chip || runtime.hardware_model || runtime.gpu_model,
-  ]
-    .filter(Boolean)
-    .join(" • ");
-  elements.detailDeviceClass.textContent = runtime.device_class || "Auto";
-  elements.detailModelPath.textContent = browserConfig.local_model_path || runtime.model_path || "—";
-  elements.detailModelRoot.textContent = runtime.local_model_root || "—";
-}
-
-function renderBrowserAiStrip(browserConfig, browserCapabilities) {
-  const firstCandidate = browserCapabilities.candidates[0];
-  const displayName = browserConfig.display_name || browserConfig.local_model_id || "the local model bundle";
-
-  if (!browserConfig.local_model_ready || !firstCandidate) {
-    setBadge(elements.browserAiBadge, "Local model missing", "is-danger");
-    elements.browserAiCopy.textContent =
-      "Chronicle is pinned to local-only browser inference and will not prompt for Hugging Face authentication. Add a supported model bundle under /models so browsers can load it directly from this server.";
-    return;
-  }
-
-  if (browserCapabilities.hasWebGPU) {
-    setBadge(elements.browserAiBadge, "Local WebGPU", "");
-    elements.browserAiCopy.textContent = browserConfig.supports_slicing
-      ? `Chronicle will load ${displayName} from this server’s /models directory and assign ${firstCandidate.sliceLabel} on this device. If the selected WebGPU slice is too heavy, it will step down through smaller local slices before touching WASM.`
-      : `Chronicle will load ${displayName} from this server’s /models directory with WebGPU on this device. Everything stays local to the browser session, and no Hugging Face login is used.`;
-  } else {
-    setBadge(elements.browserAiBadge, "Local WASM", "is-warm");
-    elements.browserAiCopy.textContent = browserConfig.supports_slicing
-      ? `WebGPU is not available in this browser, so Chronicle will still load ${displayName} locally with ${firstCandidate.sliceLabel} over WASM. It should work on more devices, but generation will be slower.`
-      : `WebGPU is not available in this browser, so Chronicle will load ${displayName} locally with WASM. It should still work, but slower.`;
-  }
-}
-
-async function runBrowserGeneration(payload) {
-  renderJobState({
-    status: "running",
-    message: "Collecting research through Chronicle",
-  });
-  const researchResponse = await fetchJSON("/api/research", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  const aiSession = await ensureBrowserSession();
-  renderJobState({
-    status: "running",
-    message: `Drafting with ${aiSession.profile.label} on this device`,
-  });
-
-  const markdown = await generateNewsletterMarkdown(researchResponse.research, aiSession);
-  const normalizedMarkdown = stripMarkdownFences(markdown);
-  const title = extractTitleFromMarkdown(normalizedMarkdown, researchResponse.research.plan.title);
-
-  renderJobState({
-    status: "running",
-    message: "Saving the Chronicle issue",
-  });
-  const saveResponse = await fetchJSON("/api/runs/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      brief: payload.brief,
-      title,
-      markdown: normalizedMarkdown,
-      depth: payload.depth,
-      explanation_style: payload.explanation_style,
-      style_instructions: payload.style_instructions,
-      audience: researchResponse.research.plan.audience,
-      tone: researchResponse.research.plan.tone,
-      queries: researchResponse.research.plan.queries,
-      sections: researchResponse.research.plan.sections,
-      sources: researchResponse.research.sources.map((source) => ({
-        ...source,
-        source_summary: source.source_text,
-        relevance_score: 0.5,
-      })),
-    }),
-  });
-
-  await syncAfterBrowserSave(saveResponse.run);
-  setGenerateBusy(false);
-  renderJobState({
-    status: "completed",
-    result: saveResponse.run,
-  });
-}
-
 async function ensureBrowserSession() {
-  if (state.browserSession?.generator) {
+  if (state.browserSession?.model) {
     return state.browserSession;
   }
 
@@ -321,6 +483,7 @@ async function ensureBrowserSession() {
   env.allowLocalModels = true;
   env.localModelPath = "/models";
   env.useBrowserCache = true;
+
   if (env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
   }
@@ -328,10 +491,6 @@ async function ensureBrowserSession() {
   let lastError = null;
   for (const candidate of state.browserCapabilities.candidates) {
     try {
-      renderJobState({
-        status: "running",
-        message: `Loading ${candidate.label} on this device`,
-      });
       const processor = await AutoProcessor.from_pretrained(candidate.model);
       const model = await AutoModelForImageTextToText.from_pretrained(
         candidate.model,
@@ -344,8 +503,9 @@ async function ensureBrowserSession() {
       };
       return state.browserSession;
     } catch (error) {
-      console.warn(`Chronicle browser candidate failed: ${candidate.label}`, error);
       lastError = error;
+      appendLogLines([`Model candidate failed: ${candidate.label}`]);
+      console.warn(`Chronicle browser candidate failed: ${candidate.label}`, error);
     }
   }
 
@@ -464,169 +624,6 @@ Requirements:
 - if market data is present, include: [M1]: CoinGecko Markets API - https://www.coingecko.com/
 - do not use markdown code fences
 - do not mention system prompts or implementation details`;
-}
-
-async function startServerGeneration(payload) {
-  const response = await fetchJSON("/api/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  state.activeJobId = response.job.id;
-  renderJobState(response.job);
-  startPolling(response.job.id);
-}
-
-function canUseServerFallback() {
-  return Boolean(state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready);
-}
-
-function renderRuns(runs) {
-  state.runs = runs;
-  elements.libraryCount.textContent = `${runs.length} ${runs.length === 1 ? "issue" : "issues"}`;
-
-  if (!runs.length) {
-    elements.runList.innerHTML = `
-      <article class="empty-state">
-        <h3>No issues yet</h3>
-        <p>Generate a Chronicle issue and it will appear here with one-click preview access.</p>
-      </article>
-    `;
-    renderPreviewEmpty();
-    return;
-  }
-
-  if (!state.selectedRunId || !runs.some((run) => run.id === state.selectedRunId)) {
-    state.selectedRunId = runs[0].id;
-  }
-
-  elements.runList.innerHTML = "";
-  runs.forEach((run) => {
-    const card = document.createElement("article");
-    card.className = "run-card";
-    if (run.id === state.selectedRunId) {
-      card.classList.add("is-selected");
-    }
-
-    card.innerHTML = `
-      <div class="run-meta">
-        <span class="chip">${escapeHtml(run.depth || "depth")}</span>
-        <span class="chip">${escapeHtml(run.explanation_style || "style")}</span>
-        <span class="chip">${formatTimestamp(run.created_at)}</span>
-      </div>
-      <h3>${escapeHtml(run.title)}</h3>
-      <p>${escapeHtml(trimText(run.brief || "", 150))}</p>
-    `;
-    card.addEventListener("click", () => {
-      state.selectedRunId = run.id;
-      renderRuns(state.runs);
-      renderPreview(run);
-    });
-    elements.runList.appendChild(card);
-  });
-
-  const selectedRun = runs.find((run) => run.id === state.selectedRunId) || runs[0];
-  renderPreview(selectedRun);
-}
-
-function renderPreview(run) {
-  if (!run) {
-    renderPreviewEmpty();
-    return;
-  }
-
-  elements.previewTitle.textContent = run.title;
-  elements.previewMode.textContent = run.html_url ? "Editable HTML issue" : "Markdown only";
-  updateActionLink(elements.previewOpenHtml, run.html_url);
-  updateActionLink(elements.previewOpenMd, run.markdown_url);
-
-  if (run.preview_url) {
-    elements.previewFrame.removeAttribute("srcdoc");
-    elements.previewFrame.src = run.preview_url;
-  } else {
-    elements.previewFrame.removeAttribute("src");
-    elements.previewFrame.srcdoc = `
-      <p style="font-family: sans-serif; color: #ddd; padding: 2rem;">
-        This issue does not have an editable HTML preview yet.
-      </p>
-    `;
-  }
-}
-
-function renderPreviewEmpty() {
-  elements.previewTitle.textContent = "Choose an issue";
-  elements.previewMode.textContent = "HTML editor";
-  updateActionLink(elements.previewOpenHtml, "");
-  updateActionLink(elements.previewOpenMd, "");
-  elements.previewFrame.removeAttribute("src");
-  elements.previewFrame.srcdoc = `
-    <p style="font-family: sans-serif; color: #ddd; padding: 2rem;">
-      Select an issue to preview it here.
-    </p>
-  `;
-}
-
-function renderJobIdle() {
-  setGenerateBusy(false);
-  setBadge(elements.jobBadge, "Idle", "");
-  elements.jobMessage.textContent = "No Chronicle issue is running right now.";
-  elements.jobSubcopy.textContent =
-    "When a run starts, Chronicle will research through the backend, draft on the user’s device, and then save the finished issue back to the library.";
-  updateActionLink(elements.jobOpenHtml, "");
-  updateActionLink(elements.jobOpenMd, "");
-
-  const latestRun = state.runs[0];
-  elements.jobRunTitle.textContent = latestRun ? latestRun.title : "—";
-  elements.jobRunTime.textContent = latestRun ? formatTimestamp(latestRun.created_at) : "—";
-}
-
-function renderJobState(job) {
-  const status = job.status || "running";
-  if (status === "failed") {
-    renderJobError(job.error?.message || job.message || "Chronicle failed to finish the run.");
-    return;
-  }
-
-  if (status === "completed") {
-    const result = job.result || null;
-    setGenerateBusy(false);
-    setBadge(elements.jobBadge, "Ready", "");
-    elements.jobMessage.textContent = result
-      ? `Chronicle finished “${result.title}” on the user’s device.`
-      : "Chronicle finished the current run.";
-    elements.jobSubcopy.textContent =
-      "Open the editable HTML issue or switch to the raw markdown source if you want the plain document.";
-    if (result) {
-      elements.jobRunTitle.textContent = result.title;
-      elements.jobRunTime.textContent = formatTimestamp(result.created_at);
-      updateActionLink(elements.jobOpenHtml, result.html_url);
-      updateActionLink(elements.jobOpenMd, result.markdown_url);
-      state.selectedRunId = result.id;
-    }
-    return;
-  }
-
-  setGenerateBusy(true);
-  setBadge(elements.jobBadge, upper(status), "is-warm");
-  elements.jobMessage.textContent = job.message || "Chronicle is running locally.";
-  elements.jobSubcopy.textContent =
-    "The browser model is doing the generation work on the user’s device. Chronicle only uses the backend for research collection and saving outputs.";
-}
-
-function renderJobError(message) {
-  setGenerateBusy(false);
-  stopPolling();
-  setBadge(elements.jobBadge, "Failed", "is-danger");
-  elements.jobMessage.textContent = message;
-  elements.jobSubcopy.textContent =
-    "If WebGPU is unavailable, Chronicle will try WASM. If the browser path still fails, enable the native runtime fallback on the machine hosting the site.";
-}
-
-function setGenerateBusy(isBusy) {
-  elements.generateButton.disabled = isBusy;
-  elements.generateButton.textContent = isBusy
-    ? "Generating on this device…"
-    : "Generate locally";
 }
 
 function calculateBrowserProfile(config) {
@@ -759,92 +756,6 @@ function dedupeCandidates(candidates) {
   });
 }
 
-function toggleCustomStyleField(visible) {
-  elements.customStyleField.classList.toggle("is-hidden", !visible);
-}
-
-function updateActionLink(link, url) {
-  if (url) {
-    link.href = url;
-    link.classList.remove("is-disabled");
-  } else {
-    link.href = "#";
-    link.classList.add("is-disabled");
-  }
-}
-
-function setBadge(element, text, modifierClass) {
-  element.textContent = text;
-  element.classList.remove("is-warm", "is-danger");
-  if (modifierClass) {
-    element.classList.add(modifierClass);
-  }
-}
-
-function startPolling(jobId) {
-  state.activeJobId = jobId;
-  stopPolling();
-  state.pollTimer = window.setInterval(async () => {
-    try {
-      const response = await fetchJSON(`/api/jobs/${jobId}`);
-      const job = response.job;
-      renderJobState(job);
-      if (job.status === "completed" || job.status === "failed") {
-        stopPolling();
-        await syncAfterJob(job);
-      }
-    } catch (error) {
-      stopPolling();
-      renderJobError(error.message || "Chronicle lost contact with the local server.");
-    }
-  }, 1800);
-}
-
-function stopPolling() {
-  if (state.pollTimer) {
-    window.clearInterval(state.pollTimer);
-    state.pollTimer = null;
-  }
-}
-
-async function syncAfterBrowserSave(run) {
-  const [statusResponse, runsResponse] = await Promise.all([
-    fetchJSON("/api/status"),
-    fetchJSON("/api/runs?limit=30"),
-  ]);
-  state.serverRuntime = statusResponse.runtime;
-  state.browserConfig = statusResponse.browser_ai;
-  state.browserCapabilities = detectBrowserCapabilities(statusResponse.browser_ai);
-  renderRuntime(statusResponse.runtime, statusResponse.browser_ai, state.browserCapabilities);
-  renderRuns(runsResponse.runs || []);
-  if (run) {
-    state.selectedRunId = run.id;
-    const selectedRun = (runsResponse.runs || []).find((item) => item.id === run.id);
-    if (selectedRun) {
-      renderPreview(selectedRun);
-    }
-  }
-}
-
-async function syncAfterJob(job) {
-  const [statusResponse, runsResponse] = await Promise.all([
-    fetchJSON("/api/status"),
-    fetchJSON("/api/runs?limit=30"),
-  ]);
-  state.serverRuntime = statusResponse.runtime;
-  state.browserConfig = statusResponse.browser_ai;
-  state.browserCapabilities = detectBrowserCapabilities(statusResponse.browser_ai);
-  renderRuntime(statusResponse.runtime, statusResponse.browser_ai, state.browserCapabilities);
-  renderRuns(runsResponse.runs || []);
-  if (job.result) {
-    state.selectedRunId = job.result.id;
-    const selectedRun = (runsResponse.runs || []).find((run) => run.id === job.result.id);
-    if (selectedRun) {
-      renderPreview(selectedRun);
-    }
-  }
-}
-
 async function fetchJSON(url, options = {}) {
   const response = await fetch(url, options);
   let data = {};
@@ -877,27 +788,6 @@ function trimText(text, maximumLength) {
     return text;
   }
   return `${text.slice(0, maximumLength - 1).trim()}…`;
-}
-
-function formatTimestamp(value) {
-  if (!value) {
-    return "—";
-  }
-  const date = new Date(value.replace(" ", "T"));
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return date.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function upper(value) {
-  return value ? String(value).toUpperCase() : "—";
 }
 
 function escapeHtml(value) {

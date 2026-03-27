@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import json
 import mimetypes
 import os
@@ -24,6 +25,7 @@ OUTPUT_ROOT = PROJECT_ROOT / "output" / "newsletters"
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOB_LOG_LIMIT = 500
 
 ALLOWED_DEPTHS = {"low", "medium", "high"}
 ALLOWED_STYLES = {"concise", "feynman", "soc", "custom"}
@@ -365,27 +367,45 @@ def collect_research_bundle(payload):
         payload["depth"],
     )
     market_snapshot = newsletter_agent.fetch_market_snapshot(payload["brief"])
+    logs = [
+        "Planning complete.",
+        f"Title: {plan['title']}",
+        f"Research depth: {payload['depth']}",
+        f"Explanation style: {payload['explanation_style']}",
+    ]
+    if market_snapshot:
+        logs.append(f"Structured market data collected for {len(market_snapshot)} assets.")
 
     collected_sources = []
-    for query in plan["queries"]:
-        results = newsletter_agent.search_web(query, settings["results_per_query"])
-        for rank_index, result in enumerate(results, start=1):
-            article_text = newsletter_agent.fetch_article_text(result["url"], settings["article_chars"])
-            source_text = newsletter_agent.build_source_text(result, article_text)
-            if not source_text:
-                continue
+    log_stream = ListLogStream(logs)
+    with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
+        for query in plan["queries"]:
+            logs.append(f"Searching: {query}")
+            results = newsletter_agent.search_web(query, settings["results_per_query"])
+            logs.append(f"  Search results: {len(results)}")
+            for rank_index, result in enumerate(results, start=1):
+                logs.append(f"  Result {rank_index}: {result['title']}")
+                article_text = newsletter_agent.fetch_article_text(result["url"], settings["article_chars"])
+                source_text = newsletter_agent.build_source_text(result, article_text)
+                if not source_text:
+                    logs.append("  Skipped source: no article text or search snippet available")
+                    continue
 
-            collected_sources.append(
-                {
-                    "query": query,
-                    "rank_index": rank_index,
-                    "title": result["title"],
-                    "url": result["url"],
-                    "snippet": result["snippet"],
-                    "article_text": article_text,
-                    "source_text": source_text,
-                }
-            )
+                collected_sources.append(
+                    {
+                        "query": query,
+                        "rank_index": rank_index,
+                        "title": result["title"],
+                        "url": result["url"],
+                        "snippet": result["snippet"],
+                        "article_text": article_text,
+                        "source_text": source_text,
+                    }
+                )
+                logs.append(f"  Source ready: {result['title']}")
+
+            if not results:
+                logs.append("  No search results collected for this query.")
 
     return {
         "brief": payload["brief"],
@@ -396,6 +416,7 @@ def collect_research_bundle(payload):
         "plan": plan,
         "market_snapshot": market_snapshot,
         "sources": collected_sources,
+        "logs": logs,
     }
 
 
@@ -481,6 +502,7 @@ def create_generation_job(payload):
             "params": payload,
             "result": None,
             "error": None,
+            "logs": ["Queued on this device"],
         }
         JOBS[job_id] = job
 
@@ -492,24 +514,30 @@ def create_generation_job(payload):
 def run_generation_job(job_id, payload):
     try:
         update_job(job_id, status="running", message="Warming the local Chronicle runtime")
-        newsletter_agent.initialize_model_runtime(payload.get("device_class"))
+        append_job_log(job_id, "Warming the local Chronicle runtime")
 
-        settings = newsletter_agent.build_research_settings(
-            payload["depth"],
-            payload["queries"],
-            payload["results_per_query"],
-        )
+        log_stream = JobLogStream(job_id)
+        with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
+            newsletter_agent.initialize_model_runtime(payload.get("device_class"))
 
-        update_job(job_id, status="running", message="Researching and drafting on this device")
-        result = newsletter_agent.run_newsletter_pipeline(
-            brief=payload["brief"],
-            days=payload["days"],
-            depth=payload["depth"],
-            explanation_style=payload["explanation_style"],
-            custom_style_instructions=payload["style_instructions"],
-            settings=settings,
-            output_dir=str(OUTPUT_ROOT),
-        )
+            settings = newsletter_agent.build_research_settings(
+                payload["depth"],
+                payload["queries"],
+                payload["results_per_query"],
+            )
+
+            update_job(job_id, status="running", message="Researching and drafting on this device")
+            append_job_log(job_id, "Researching and drafting on this device")
+            result = newsletter_agent.run_newsletter_pipeline(
+                brief=payload["brief"],
+                days=payload["days"],
+                depth=payload["depth"],
+                explanation_style=payload["explanation_style"],
+                custom_style_instructions=payload["style_instructions"],
+                settings=settings,
+                output_dir=str(OUTPUT_ROOT),
+            )
+        log_stream.flush()
 
         run_record = fetch_run_by_id(result["run_id"])
         update_job(
@@ -519,6 +547,7 @@ def run_generation_job(job_id, payload):
             result=run_record,
             error=None,
         )
+        append_job_log(job_id, "Issue ready")
     except SystemExit as exc:
         update_job(
             job_id,
@@ -529,6 +558,7 @@ def run_generation_job(job_id, payload):
                 "traceback": traceback.format_exc(),
             },
         )
+        append_job_log(job_id, f"Failed: {exc}")
     except Exception as exc:
         update_job(
             job_id,
@@ -539,6 +569,7 @@ def run_generation_job(job_id, payload):
                 "traceback": traceback.format_exc(),
             },
         )
+        append_job_log(job_id, f"Failed: {exc}")
 
 
 def update_job(job_id, **changes):
@@ -548,13 +579,13 @@ def update_job(job_id, **changes):
             return None
         job.update(changes)
         job["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        return dict(job)
+        return snapshot_job_data(job)
 
 
 def get_job(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-        return dict(job) if job else None
+        return snapshot_job_data(job) if job else None
 
 
 def snapshot_job(job_id):
@@ -564,7 +595,7 @@ def snapshot_job(job_id):
 def find_active_job():
     with JOBS_LOCK:
         job = find_active_job_locked()
-        return dict(job) if job else None
+        return snapshot_job_data(job) if job else None
 
 
 def find_active_job_locked():
@@ -572,6 +603,84 @@ def find_active_job_locked():
         if job["status"] in {"queued", "running"}:
             return job
     return None
+
+
+def snapshot_job_data(job):
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "message": job["message"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "params": dict(job.get("params") or {}),
+        "result": dict(job.get("result") or {}) if job.get("result") else None,
+        "error": dict(job.get("error") or {}) if job.get("error") else None,
+        "logs": list(job.get("logs") or []),
+    }
+
+
+def append_job_log(job_id, message):
+    text = str(message or "").strip()
+    if not text:
+        return None
+
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return None
+        job.setdefault("logs", []).append(text)
+        if len(job["logs"]) > JOB_LOG_LIMIT:
+            job["logs"] = job["logs"][-JOB_LOG_LIMIT:]
+        job["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return snapshot_job_data(job)
+
+
+class JobLogStream:
+    def __init__(self, job_id):
+        self.job_id = job_id
+        self._buffer = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+
+        self._buffer += str(data)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            cleaned = line.strip()
+            if cleaned:
+                append_job_log(self.job_id, cleaned)
+        return len(data)
+
+    def flush(self):
+        cleaned = self._buffer.strip()
+        if cleaned:
+            append_job_log(self.job_id, cleaned)
+        self._buffer = ""
+
+
+class ListLogStream:
+    def __init__(self, logs):
+        self.logs = logs
+        self._buffer = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+
+        self._buffer += str(data)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            cleaned = line.strip()
+            if cleaned:
+                self.logs.append(cleaned)
+        return len(data)
+
+    def flush(self):
+        cleaned = self._buffer.strip()
+        if cleaned:
+            self.logs.append(cleaned)
+        self._buffer = ""
 
 
 def count_runs():
