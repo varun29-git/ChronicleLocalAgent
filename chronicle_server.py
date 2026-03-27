@@ -6,6 +6,7 @@ import os
 import platform
 import sqlite3
 import threading
+import time
 import traceback
 import uuid
 from datetime import UTC, datetime
@@ -371,7 +372,7 @@ def collect_research_bundle(payload):
         int(settings.get("research_budget_seconds", 75)),
         max(30, newsletter_agent.MAX_NEWSLETTER_RUNTIME_SECONDS - 120),
     )
-    research_deadline = newsletter_agent.time.monotonic() + research_budget_seconds
+    research_deadline = time.monotonic() + research_budget_seconds
     logs = [
         "Planning complete.",
         f"Title: {plan['title']}",
@@ -387,7 +388,7 @@ def collect_research_bundle(payload):
     log_stream = ListLogStream(logs)
     with contextlib.redirect_stdout(log_stream), contextlib.redirect_stderr(log_stream):
         for query in plan["queries"]:
-            if newsletter_agent.time.monotonic() >= research_deadline:
+            if time.monotonic() >= research_deadline:
                 logs.append("Research budget reached. Drafting with the material already collected.")
                 break
 
@@ -399,7 +400,7 @@ def collect_research_bundle(payload):
             )
             logs.append(f"  Search results: {len(results)}")
             for rank_index, result in enumerate(results, start=1):
-                if newsletter_agent.time.monotonic() >= research_deadline:
+                if time.monotonic() >= research_deadline:
                     logs.append("  Research budget reached while processing results.")
                     break
 

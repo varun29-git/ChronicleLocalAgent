@@ -12,6 +12,7 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 from newsletter_schema import DB_PATH, initialize_database
@@ -1347,6 +1348,7 @@ def looks_like_crypto_brief(brief):
 
 def search_web(query, max_results, deadline=None):
     providers = (
+        ("Google News RSS", search_google_news_rss),
         ("DuckDuckGo HTML", search_duckduckgo_html),
         ("DuckDuckGo Lite", search_duckduckgo_lite),
         ("Bing", search_bing_html),
@@ -1385,6 +1387,35 @@ def search_web(query, max_results, deadline=None):
                     return results[:max_results]
 
     return results[:max_results]
+
+
+def search_google_news_rss(query, max_results):
+    rss_query = urllib.parse.quote(f"{query} when:7d")
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{rss_query}&hl=en-US&gl=US&ceid=US:en"
+    )
+    xml_text = fetch_url(url)
+
+    results = []
+    root = ET.fromstring(xml_text)
+    for item in root.findall(".//item"):
+        title = clean_text(item.findtext("title", ""))
+        url = clean_text(item.findtext("link", ""))
+        snippet = strip_tags(item.findtext("description", ""))
+        if not title or not url:
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    return results
 
 
 def search_duckduckgo_html(query, max_results):
@@ -1717,6 +1748,7 @@ Source summaries:
 
 Requirements:
 - write a strong headline
+- aim for roughly 550 to 800 words
 - include a short opening note with a point of view
 - organize the body around the planned sections
 - make it readable, analytical, and confident
@@ -1801,6 +1833,7 @@ Structured market data:
 
 Requirements:
 - begin with a bold note that live web source collection failed
+- keep the draft within roughly 450 to 700 words
 - state clearly that the draft is based on the brief, plan, and any structured market data only
 - do not invent recent events, dates, quotes, numbers, or citations from external reporting
 - if structured market data is present, you may reference it and cite it as [M1]
