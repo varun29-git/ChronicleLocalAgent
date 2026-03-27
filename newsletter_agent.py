@@ -790,11 +790,12 @@ def resolve_browser_model_location(model_reference):
     if not model_reference:
         return "", ""
 
+    model_root = os.path.abspath(DEFAULT_MODEL_ROOT)
     expanded_reference = os.path.expanduser(model_reference)
     if os.path.isabs(expanded_reference):
         normalized_path = os.path.normpath(expanded_reference)
         try:
-            model_id = os.path.relpath(normalized_path, DEFAULT_MODEL_ROOT).replace("\\", "/")
+            model_id = os.path.relpath(normalized_path, model_root).replace("\\", "/")
         except ValueError:
             return normalized_path, ""
         if model_id.startswith("../"):
@@ -805,7 +806,7 @@ def resolve_browser_model_location(model_reference):
     if normalized_reference.startswith("models/"):
         normalized_reference = normalized_reference.removeprefix("models/")
 
-    model_path = os.path.normpath(os.path.join(DEFAULT_MODEL_ROOT, normalized_reference))
+    model_path = os.path.normpath(os.path.join(model_root, normalized_reference))
     model_id = normalized_reference
     return model_path, model_id
 

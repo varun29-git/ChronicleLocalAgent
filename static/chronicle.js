@@ -172,7 +172,9 @@ function renderRuntime(runtime, browserConfig, browserCapabilities) {
   const dependenciesReady = Boolean(runtime.dependencies_ready);
   const modelReady = Boolean(runtime.model_ready);
   const browserModelReady = Boolean(browserConfig.local_model_ready);
-  if (!dependenciesReady) {
+  if (browserModelReady && (!dependenciesReady || !modelReady)) {
+    setBadge(elements.runtimeBadge, "Browser ready", "");
+  } else if (!dependenciesReady) {
     setBadge(elements.runtimeBadge, "Deps missing", "is-danger");
   } else if (!modelReady) {
     setBadge(elements.runtimeBadge, "Model missing", "is-warm");
