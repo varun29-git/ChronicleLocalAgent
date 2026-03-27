@@ -1,4 +1,4 @@
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
 
 const state = {
   runs: [],
@@ -146,40 +146,24 @@ function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
   const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
-  const highTier = hasWebGPU && deviceMemory >= 8 && hardwareConcurrency >= 8;
-  const balancedTier = hasWebGPU;
-
-  const candidates = [];
-  if (highTier) {
-    candidates.push({
-      device: "webgpu",
-      model: browserConfig.high_tier_model,
-      label: "WebGPU high tier",
-      maxNewTokens: 900,
-      temperature: 0.2,
-    });
-  }
-  if (balancedTier) {
-    candidates.push({
-      device: "webgpu",
-      model: browserConfig.low_tier_model,
-      label: highTier ? "WebGPU balanced fallback" : "WebGPU balanced",
-      maxNewTokens: 640,
-      temperature: 0.2,
-    });
-  }
-  candidates.push({
-    device: "wasm",
-    model: browserConfig.cpu_fallback_model,
-    label: hasWebGPU ? "WASM CPU fallback" : "WASM universal fallback",
-    maxNewTokens: 420,
-    temperature: 0.25,
+  const recommendedProfile = calculateBrowserProfile({
+    hasWebGPU,
+    deviceMemory,
+    hardwareConcurrency,
+    supportsSlicing: Boolean(browserConfig?.supports_slicing),
+    maxSlices: Number(browserConfig?.max_slices || 1),
+  });
+  const candidates = buildBrowserCandidates(browserConfig, recommendedProfile, {
+    hasWebGPU,
+    deviceMemory,
+    hardwareConcurrency,
   });
 
   return {
     hasWebGPU,
     deviceMemory,
     hardwareConcurrency,
+    recommendedProfile,
     candidates,
   };
 }
@@ -187,6 +171,7 @@ function detectBrowserCapabilities(browserConfig) {
 function renderRuntime(runtime, browserConfig, browserCapabilities) {
   const dependenciesReady = Boolean(runtime.dependencies_ready);
   const modelReady = Boolean(runtime.model_ready);
+  const browserModelReady = Boolean(browserConfig.local_model_ready);
   if (!dependenciesReady) {
     setBadge(elements.runtimeBadge, "Deps missing", "is-danger");
   } else if (!modelReady) {
@@ -197,28 +182,36 @@ function renderRuntime(runtime, browserConfig, browserCapabilities) {
 
   elements.runtimeHeadline.textContent =
     `Chronicle is using ${runtime.hostname} as the local device anchor.`;
-  if (!dependenciesReady) {
+  if (browserModelReady && (!dependenciesReady || !modelReady)) {
+    elements.runtimeSubline.textContent =
+      "The local browser model bundle is ready and does not require any Hugging Face login. The native server runtime on this host is optional and only used as a fallback when it is fully installed.";
+  } else if (!dependenciesReady) {
     elements.runtimeSubline.textContent =
       `${runtime.dependency_message}. The browser AI path can still run if the user’s browser supports it, but native runtime fallback on this machine is not ready yet.`;
   } else if (!modelReady) {
     elements.runtimeSubline.textContent =
-      "The server-side local runtime is alive, but the configured local model path is missing. Browser AI can still run independently when WebGPU or WASM is available.";
+      "The server-side local runtime is alive, but the configured fallback model path is missing. Browser AI can still run independently when the local browser bundle is present.";
   } else {
     elements.runtimeSubline.textContent =
-      "Both Chronicle modes are visible here: browser AI for cross-device inference and the native local runtime as a fallback path.";
+      "Both Chronicle modes are available here: the browser loads a local model bundle for cross-device inference, and the native server runtime remains available as a fallback path.";
   }
 
   renderBrowserAiStrip(browserConfig, browserCapabilities);
 
   elements.statBackend.textContent = browserCapabilities.hasWebGPU ? "WEBGPU" : "WASM";
-  elements.statSlice.textContent = runtime.slice_label || "—";
+  elements.statSlice.textContent =
+    browserCapabilities.recommendedProfile?.label || runtime.slice_label || "—";
   elements.statMemory.textContent =
     browserCapabilities.deviceMemory > 0
       ? `${browserCapabilities.deviceMemory.toFixed(1)} GB`
       : runtime.memory_total_gb
         ? `${runtime.memory_total_gb.toFixed(1)} GB`
         : "Unknown";
-  elements.statModelReady.textContent = modelReady ? "Fallback ready" : "Fallback limited";
+  elements.statModelReady.textContent = browserModelReady
+    ? "Local browser ready"
+    : modelReady
+      ? "Fallback ready"
+      : "Model missing";
 
   elements.detailHostname.textContent = runtime.hostname || "This device";
   elements.detailPlatform.textContent = [
@@ -229,20 +222,31 @@ function renderRuntime(runtime, browserConfig, browserCapabilities) {
     .filter(Boolean)
     .join(" • ");
   elements.detailDeviceClass.textContent = runtime.device_class || "Auto";
-  elements.detailModelPath.textContent = runtime.model_path || "—";
+  elements.detailModelPath.textContent = browserConfig.local_model_path || runtime.model_path || "—";
   elements.detailModelRoot.textContent = runtime.local_model_root || "—";
 }
 
 function renderBrowserAiStrip(browserConfig, browserCapabilities) {
   const firstCandidate = browserCapabilities.candidates[0];
+  const displayName = browserConfig.display_name || browserConfig.local_model_id || "the local model bundle";
+
+  if (!browserConfig.local_model_ready || !firstCandidate) {
+    setBadge(elements.browserAiBadge, "Local model missing", "is-danger");
+    elements.browserAiCopy.textContent =
+      "Chronicle is pinned to local-only browser inference and will not prompt for Hugging Face authentication. Add a supported model bundle under /models so browsers can load it directly from this server.";
+    return;
+  }
+
   if (browserCapabilities.hasWebGPU) {
-    setBadge(elements.browserAiBadge, "WebGPU ready", "");
-    elements.browserAiCopy.textContent =
-      `Chronicle will try ${firstCandidate.model} in the browser with WebGPU first, then fall back through lighter local paths if the device cannot hold that tier.`;
+    setBadge(elements.browserAiBadge, "Local WebGPU", "");
+    elements.browserAiCopy.textContent = browserConfig.supports_slicing
+      ? `Chronicle will load ${displayName} from this server’s /models directory and assign ${firstCandidate.sliceLabel} on this device. If the selected WebGPU slice is too heavy, it will step down through smaller local slices before touching WASM.`
+      : `Chronicle will load ${displayName} from this server’s /models directory with WebGPU on this device. Everything stays local to the browser session, and no Hugging Face login is used.`;
   } else {
-    setBadge(elements.browserAiBadge, "WASM fallback", "is-warm");
-    elements.browserAiCopy.textContent =
-      `WebGPU is not available in this browser, so Chronicle will fall back to ${browserConfig.cpu_fallback_model} with browser-side WASM execution. It should still run, but slower.`;
+    setBadge(elements.browserAiBadge, "Local WASM", "is-warm");
+    elements.browserAiCopy.textContent = browserConfig.supports_slicing
+      ? `WebGPU is not available in this browser, so Chronicle will still load ${displayName} locally with ${firstCandidate.sliceLabel} over WASM. It should work on more devices, but generation will be slower.`
+      : `WebGPU is not available in this browser, so Chronicle will load ${displayName} locally with WASM. It should still work, but slower.`;
   }
 }
 
@@ -306,8 +310,14 @@ async function ensureBrowserSession() {
     return state.browserSession;
   }
 
+  if (!state.browserConfig?.local_model_ready || !state.browserConfig?.local_model_id) {
+    throw new Error("No local browser model bundle is available on this server.");
+  }
+
   const { pipeline, env } = await import(TRANSFORMERS_CDN);
-  env.allowLocalModels = false;
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  env.localModelPath = "/models";
   env.useBrowserCache = true;
   if (env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
@@ -318,18 +328,16 @@ async function ensureBrowserSession() {
     try {
       renderJobState({
         status: "running",
-        message: `Loading ${candidate.model} with ${candidate.device.toUpperCase()} on this device`,
+        message: `Loading ${candidate.label} on this device`,
       });
-      const generator = await pipeline("text-generation", candidate.model, {
-        device: candidate.device,
-      });
+      const generator = await pipeline("text-generation", candidate.model, candidate.pipelineOptions);
       state.browserSession = {
         generator,
         profile: candidate,
       };
       return state.browserSession;
     } catch (error) {
-      console.warn(`Chronicle browser candidate failed: ${candidate.model}`, error);
+      console.warn(`Chronicle browser candidate failed: ${candidate.label}`, error);
       lastError = error;
     }
   }
@@ -443,7 +451,7 @@ async function startServerGeneration(payload) {
 }
 
 function canUseServerFallback() {
-  return Boolean(state.serverRuntime?.dependencies_ready);
+  return Boolean(state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready);
 }
 
 function renderRuns(runs) {
@@ -591,7 +599,133 @@ function setGenerateBusy(isBusy) {
   elements.generateButton.disabled = isBusy;
   elements.generateButton.textContent = isBusy
     ? "Generating on this device…"
-    : "Generate with browser AI";
+    : "Generate locally";
+}
+
+function calculateBrowserProfile(config) {
+  const maxSlices = Math.max(1, Number(config.maxSlices || 1));
+  const supportsSlicing = Boolean(config.supportsSlicing && maxSlices > 1);
+
+  if (!supportsSlicing) {
+    return {
+      sliceCount: 1,
+      percentage: 100,
+      label: "Single bundle",
+      maxNewTokens: config.hasWebGPU ? 900 : 520,
+      temperature: 0.2,
+    };
+  }
+
+  let sliceCount = 1;
+  if (config.hasWebGPU && (config.deviceMemory >= 8 || config.hardwareConcurrency >= 16)) {
+    sliceCount = maxSlices;
+  } else if (config.hasWebGPU && config.deviceMemory >= 8) {
+    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.75));
+  } else if (config.hasWebGPU || config.deviceMemory >= 8 || config.hardwareConcurrency >= 8) {
+    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.5));
+  } else if (config.deviceMemory >= 4) {
+    sliceCount = Math.max(1, Math.ceil(maxSlices * 0.25));
+  }
+
+  const percentage = Math.round((sliceCount / maxSlices) * 100);
+  let maxNewTokens = 420;
+  if (percentage >= 75) {
+    maxNewTokens = 900;
+  } else if (percentage >= 50) {
+    maxNewTokens = 720;
+  } else if (percentage >= 25) {
+    maxNewTokens = 560;
+  }
+
+  return {
+    sliceCount,
+    percentage,
+    label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
+    maxNewTokens,
+    temperature: 0.2,
+  };
+}
+
+function buildBrowserCandidates(browserConfig, recommendedProfile, deviceConfig) {
+  if (!browserConfig?.local_model_ready || !browserConfig?.local_model_id) {
+    return [];
+  }
+
+  const supportsSlicing = Boolean(browserConfig.supports_slicing && browserConfig.max_slices > 1);
+  const candidates = [];
+  const preferredSlices = supportsSlicing
+    ? buildSliceFallbackChain(recommendedProfile.sliceCount, Number(browserConfig.max_slices || 1))
+    : [1];
+
+  if (deviceConfig.hasWebGPU) {
+    preferredSlices.forEach((sliceCount) => {
+      candidates.push(buildBrowserCandidate(browserConfig, "webgpu", sliceCount, recommendedProfile));
+    });
+  }
+
+  const wasmSlices = supportsSlicing
+    ? buildSliceFallbackChain(Math.min(recommendedProfile.sliceCount, 2), Number(browserConfig.max_slices || 1))
+    : [1];
+  wasmSlices.forEach((sliceCount) => {
+    candidates.push(buildBrowserCandidate(browserConfig, "wasm", sliceCount, recommendedProfile));
+  });
+
+  return dedupeCandidates(candidates);
+}
+
+function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedProfile) {
+  const supportsSlicing = Boolean(browserConfig.supports_slicing && browserConfig.max_slices > 1);
+  const normalizedSliceCount = Math.max(1, sliceCount || 1);
+  const maxSlices = Math.max(1, Number(browserConfig.max_slices || 1));
+  const percentage = Math.round((normalizedSliceCount / maxSlices) * 100);
+  const sliceLabel = supportsSlicing
+    ? `${percentage}% slice (${normalizedSliceCount}/${maxSlices})`
+    : "Single bundle";
+  const maxNewTokens = device === "webgpu"
+    ? Math.max(480, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 80)
+    : Math.min(420, recommendedProfile.maxNewTokens);
+  const pipelineOptions = { device };
+
+  if (supportsSlicing) {
+    pipelineOptions.model_kwargs = { num_slices: normalizedSliceCount };
+  }
+
+  return {
+    device,
+    model: browserConfig.local_model_id,
+    label: `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}`,
+    sliceCount: normalizedSliceCount,
+    sliceLabel,
+    percentage,
+    maxNewTokens,
+    temperature: recommendedProfile.temperature,
+    pipelineOptions,
+  };
+}
+
+function buildSliceFallbackChain(targetSlices, maxSlices) {
+  const chain = [];
+  const normalizedTarget = Math.max(1, Math.min(targetSlices || 1, maxSlices || 1));
+  [normalizedTarget, Math.ceil(normalizedTarget * 0.75), Math.ceil(normalizedTarget * 0.5), 2, 1]
+    .forEach((value) => {
+      const sliceCount = Math.max(1, Math.min(value, maxSlices));
+      if (!chain.includes(sliceCount)) {
+        chain.push(sliceCount);
+      }
+    });
+  return chain;
+}
+
+function dedupeCandidates(candidates) {
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    const key = `${candidate.device}:${candidate.model}:${candidate.sliceCount}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function toggleCustomStyleField(visible) {

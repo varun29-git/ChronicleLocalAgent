@@ -19,6 +19,7 @@ from newsletter_schema import DB_PATH, initialize_database
 PROJECT_ROOT = Path(__file__).resolve().parent
 FRONTEND_ROOT = PROJECT_ROOT / "frontend"
 STATIC_ROOT = PROJECT_ROOT / "static"
+MODELS_ROOT = Path(newsletter_agent.DEFAULT_MODEL_ROOT).resolve()
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "newsletters"
 
 JOBS = {}
@@ -131,6 +132,10 @@ class ChronicleHandler(BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             relative_path = path.removeprefix("/static/")
             return self.serve_safe_path(STATIC_ROOT, relative_path, send_body=send_body)
+
+        if path.startswith("/models/"):
+            relative_path = path.removeprefix("/models/")
+            return self.serve_safe_path(MODELS_ROOT, relative_path, send_body=send_body)
 
         if path.startswith("/newsletters/"):
             relative_path = path.removeprefix("/newsletters/")
@@ -312,13 +317,21 @@ def build_runtime_snapshot():
 
 
 def build_browser_ai_snapshot():
+    browser_model = newsletter_agent.describe_browser_model()
     return {
         "provider": "@huggingface/transformers",
+        "transformers_js_version": "3.7.2",
         "preferred_backend": "webgpu",
         "fallback_backend": "wasm",
-        "high_tier_model": "onnx-community/Qwen2-0.5B-Instruct-ONNX",
-        "low_tier_model": "onnx-community/SmolLM2-135M-Instruct-ONNX-MHA",
-        "cpu_fallback_model": "onnx-community/SmolLM2-135M-Instruct-ONNX",
+        "allow_remote_models": False,
+        "local_model_ready": browser_model["ready"],
+        "local_model_id": browser_model["model_id"],
+        "local_model_path": browser_model["model_path"],
+        "model_type": browser_model["model_type"],
+        "architecture": browser_model["architecture"],
+        "supports_slicing": browser_model["supports_slicing"],
+        "max_slices": browser_model["max_slices"],
+        "display_name": browser_model["display_name"],
     }
 
 

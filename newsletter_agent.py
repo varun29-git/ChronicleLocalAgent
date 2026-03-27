@@ -38,6 +38,17 @@ DEFAULT_TRANSFORMERS_MODEL_PATH = os.environ.get(
     os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH),
 )
 DEFAULT_MODEL_PATH = os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_MLX_MODEL_PATH)
+DEFAULT_BROWSER_MODEL_ID = os.environ.get("NEWSLETTER_AGENT_BROWSER_MODEL_ID", "").strip()
+DEFAULT_BROWSER_MODEL_CANDIDATES = tuple(
+    candidate
+    for candidate in (
+        DEFAULT_BROWSER_MODEL_ID,
+        "onnx-community/gemma-3n-E2B-it-ONNX",
+        "gemma-3n-E2B-it-ONNX",
+        "gemma-3-it",
+    )
+    if candidate
+)
 DEFAULT_DAYS = 7
 DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
@@ -712,6 +723,91 @@ def build_missing_local_model_message(runtime_backend, model_path):
         f"  3. If you intentionally want Hugging Face downloads, set the override to a hub "
         f"model id such as {default_repo} after authenticating for gated access"
     )
+
+
+def describe_browser_model():
+    missing_descriptor = None
+
+    for candidate in DEFAULT_BROWSER_MODEL_CANDIDATES:
+        descriptor = build_browser_model_descriptor(candidate)
+        if descriptor["ready"]:
+            return descriptor
+        if missing_descriptor is None:
+            missing_descriptor = descriptor
+
+    return missing_descriptor or {
+        "ready": False,
+        "model_id": "",
+        "model_path": "",
+        "model_type": "",
+        "architecture": "",
+        "supports_slicing": False,
+        "max_slices": 1,
+        "display_name": "No local browser model found",
+    }
+
+
+def build_browser_model_descriptor(model_reference):
+    normalized_reference = str(model_reference or "").strip().replace("\\", "/").strip("/")
+    model_path, model_id = resolve_browser_model_location(normalized_reference)
+    config_path = os.path.join(model_path, "config.json") if model_path else ""
+    config_data = {}
+
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as handle:
+                config_data = json.load(handle)
+        except Exception:
+            config_data = {}
+
+    model_type = str(config_data.get("model_type") or "").strip()
+    architectures = config_data.get("architectures") or []
+    architecture = str(architectures[0]).strip() if architectures else ""
+    lower_hints = " ".join(
+        part
+        for part in (
+            normalized_reference.lower(),
+            model_type.lower(),
+            architecture.lower(),
+        )
+        if part
+    )
+    supports_slicing = "gemma3n" in lower_hints or "gemma-3n" in lower_hints
+
+    return {
+        "ready": bool(model_path and os.path.isdir(model_path) and os.path.exists(config_path)),
+        "model_id": model_id,
+        "model_path": model_path,
+        "model_type": model_type,
+        "architecture": architecture,
+        "supports_slicing": supports_slicing,
+        "max_slices": 8 if supports_slicing else 1,
+        "display_name": architecture or model_type or normalized_reference or "Local browser model",
+    }
+
+
+def resolve_browser_model_location(model_reference):
+    if not model_reference:
+        return "", ""
+
+    expanded_reference = os.path.expanduser(model_reference)
+    if os.path.isabs(expanded_reference):
+        normalized_path = os.path.normpath(expanded_reference)
+        try:
+            model_id = os.path.relpath(normalized_path, DEFAULT_MODEL_ROOT).replace("\\", "/")
+        except ValueError:
+            return normalized_path, ""
+        if model_id.startswith("../"):
+            return normalized_path, ""
+        return normalized_path, model_id
+
+    normalized_reference = expanded_reference.replace("\\", "/").strip("/")
+    if normalized_reference.startswith("models/"):
+        normalized_reference = normalized_reference.removeprefix("models/")
+
+    model_path = os.path.normpath(os.path.join(DEFAULT_MODEL_ROOT, normalized_reference))
+    model_id = normalized_reference
+    return model_path, model_id
 
 
 def format_slice_label(slice_ratio):
