@@ -773,6 +773,7 @@ def build_browser_model_descriptor(model_reference):
         if part
     )
     supports_slicing = "gemma3n" in lower_hints or "gemma-3n" in lower_hints
+    preferred_precision, dtype_map = detect_browser_model_precision(model_path)
 
     return {
         "ready": bool(model_path and os.path.isdir(model_path) and os.path.exists(config_path)),
@@ -782,6 +783,8 @@ def build_browser_model_descriptor(model_reference):
         "architecture": architecture,
         "supports_slicing": supports_slicing,
         "max_slices": 8 if supports_slicing else 1,
+        "preferred_precision": preferred_precision,
+        "dtype_map": dtype_map,
         "display_name": architecture or model_type or normalized_reference or "Local browser model",
     }
 
@@ -809,6 +812,32 @@ def resolve_browser_model_location(model_reference):
     model_path = os.path.normpath(os.path.join(model_root, normalized_reference))
     model_id = normalized_reference
     return model_path, model_id
+
+
+def detect_browser_model_precision(model_path):
+    if not model_path:
+        return "", {}
+
+    onnx_root = os.path.join(model_path, "onnx")
+    if not os.path.isdir(onnx_root):
+        return "", {}
+
+    precision_pairs = (
+        ("q4", "decoder_model_merged_q4.onnx", "embed_tokens_q4.onnx"),
+        ("q4f16", "decoder_model_merged_q4f16.onnx", "embed_tokens_q4f16.onnx"),
+        ("quantized", "decoder_model_merged_quantized.onnx", "embed_tokens_quantized.onnx"),
+        ("uint8", "decoder_model_merged_uint8.onnx", "embed_tokens_uint8.onnx"),
+    )
+    for precision, decoder_name, embedding_name in precision_pairs:
+        if os.path.exists(os.path.join(onnx_root, decoder_name)) and os.path.exists(
+            os.path.join(onnx_root, embedding_name)
+        ):
+            return precision, {
+                "decoder_model_merged": precision,
+                "embed_tokens": precision,
+            }
+
+    return "", {}
 
 
 def format_slice_label(slice_ratio):

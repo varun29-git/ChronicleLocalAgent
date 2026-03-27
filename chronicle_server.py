@@ -331,6 +331,8 @@ def build_browser_ai_snapshot():
         "architecture": browser_model["architecture"],
         "supports_slicing": browser_model["supports_slicing"],
         "max_slices": browser_model["max_slices"],
+        "preferred_precision": browser_model["preferred_precision"],
+        "dtype_map": browser_model["dtype_map"],
         "display_name": browser_model["display_name"],
     }
 

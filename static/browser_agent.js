@@ -3,8 +3,8 @@
  * Powered by Gemma 3n MatFormer via Transformers.js
  */
 
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
-const MODEL_ID = "gemma-3-it";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
+const MODEL_ID = "onnx-community/gemma-3n-E2B-it-ONNX";
 
 let generatorPipeline = null;
 let currentProfile = null;
@@ -93,6 +93,10 @@ export async function initializeAgent() {
   // Initialize the text-generation pipeline with the calculated slices
   generatorPipeline = await pipeline("text-generation", MODEL_ID, {
     device: sliceProfile.backend,
+    dtype: {
+      decoder_model_merged: "q4",
+      embed_tokens: "q4",
+    },
     model_kwargs: {
       num_slices: sliceProfile.num_slices,
     },

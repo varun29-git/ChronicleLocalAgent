@@ -1,25 +1,50 @@
 # Local Model Setup
 
-This project now prefers local model directories by default so end users do not need to authenticate with Hugging Face on first run.
+Chronicle is now local-first for browser inference:
 
-Default layout:
+- the browser runtime loads models from `/models`
+- `env.allowRemoteModels` is disabled in the frontend
+- end users are not asked for Hugging Face authentication when the bundle exists locally
+
+## Preferred browser bundle
+
+For adaptive Gemma 3n slicing, place the ONNX bundle here:
 
 ```text
 models/
-  mlx-community/
-    gemma-3-4b-it-4bit/
-  google/
-    gemma-2-2b-it/
+  onnx-community/
+    gemma-3n-E2B-it-ONNX/
 ```
 
-Backend behavior:
+Chronicle will also detect these fallback locations:
 
-- Apple Silicon macOS defaults to the MLX model at `models/mlx-community/gemma-3-4b-it-4bit`
-- Other platforms default to the Transformers model at `models/google/gemma-2-2b-it`
+```text
+models/
+  gemma-3n-E2B-it-ONNX/
+  gemma-3-it/
+```
 
-Optional overrides:
+## Download the public Gemma 3n bundle
+
+```bash
+gemma-env/bin/python download_browser_model.py
+```
+
+The downloader targets `onnx-community/gemma-3n-E2B-it-ONNX` and does not require a Hugging Face token.
+
+## Backend fallback
+
+The native Python runtime is still separate from the browser bundle:
+
+- Apple Silicon fallback expects `models/mlx-community/gemma-3-4b-it-4bit`
+- portable Transformers fallback expects `models/google/gemma-2-2b-it`
+
+If those fallback directories are missing, Chronicle can still run through the browser-local path as long as a browser bundle exists under `/models`.
+
+## Optional overrides
 
 - `NEWSLETTER_AGENT_MODEL_ROOT`
+- `NEWSLETTER_AGENT_BROWSER_MODEL_ID`
 - `NEWSLETTER_AGENT_MODEL`
 - `NEWSLETTER_AGENT_MODEL_TRANSFORMERS`
 - `NEWSLETTER_AGENT_MODEL_LOW`
@@ -30,5 +55,3 @@ Optional overrides:
 - `NEWSLETTER_AGENT_MODEL_SLICE_50`
 - `NEWSLETTER_AGENT_MODEL_SLICE_75`
 - `NEWSLETTER_AGENT_MODEL_SLICE_100`
-
-If you intentionally want Hugging Face downloads instead of local files, point the relevant override at a hub model id and authenticate separately for gated models.

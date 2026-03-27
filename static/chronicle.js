@@ -688,6 +688,10 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     : Math.min(420, recommendedProfile.maxNewTokens);
   const pipelineOptions = { device };
 
+  if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {
+    pipelineOptions.dtype = browserConfig.dtype_map;
+  }
+
   if (supportsSlicing) {
     pipelineOptions.model_kwargs = { num_slices: normalizedSliceCount };
   }
