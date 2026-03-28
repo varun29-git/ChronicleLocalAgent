@@ -2,7 +2,6 @@ const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers
 
 const MODEL_CANDIDATES = [
   "onnx-community/gemma-3n-E2B-it-ONNX",
-  "gemma-3n-E2B-it-ONNX",
 ];
 
 const GEMMA3N_DTYPE_MAP = {
@@ -49,7 +48,6 @@ const WRITER_POLICY = {
   polishOnPassOnly: true,
   polishMaxTokens: 520,
   polishTimeoutMs: 50000,
-  stage4DeadlineMs: 95000,
   openingAttemptTimeoutMs: 22000,
   sectionAttemptTimeoutMs: 22000,
 };
@@ -60,13 +58,14 @@ const state = {
   browserSession: null,
   browserSessionPromise: null,
   browserWarmStarted: false,
-  browserRuntimeStatus: "warming",
-  browserRuntimeMessage: "Warming the local browser model…",
-  browserRuntimeProgress: 0.04,
-  browserRuntimeProgressText: "Starting warmup…",
+  browserRuntimeStatus: "idle",
+  browserRuntimeMessage: "Model is idle. Chronicle will load it when you click Generate.",
+  browserRuntimeProgress: 0,
+  browserRuntimeProgressText: "Ready to initialize",
   browserLoadProgressEntries: {},
   browserLoadCandidate: "",
   browserLastProgressAt: 0,
+  browserLoadStartedAt: 0,
   transformersRuntimePromise: null,
   currentTurn: null,
   activeStageKey: null,
@@ -149,7 +148,6 @@ async function hydrateApp() {
   state.browserCapabilities = detectBrowserCapabilities();
   state.browserProfile = calculateBrowserProfile(state.browserCapabilities);
   renderHeaderStatus();
-  warmBrowserSessionInBackground();
 }
 
 function renderHeaderStatus() {
@@ -170,6 +168,12 @@ function renderHeaderStatus() {
 
   if (state.browserRuntimeStatus === "ready") {
     setStatusPill("Gemma 3n ready");
+    elements.statusCopy.textContent = state.browserRuntimeMessage;
+    return;
+  }
+
+  if (state.browserRuntimeStatus === "idle") {
+    setStatusPill("Model idle");
     elements.statusCopy.textContent = state.browserRuntimeMessage;
     return;
   }
@@ -229,6 +233,7 @@ async function runBrowserPipeline(payload) {
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
+  run.searchStartedAt = performance.now();
   setStageState("search", "active", "Connecting to Google");
   updateTurnStatus("Fetching Google results");
   run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
@@ -239,6 +244,7 @@ async function runBrowserPipeline(payload) {
 
   state.activeStageKey = "summarize";
   const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
+  run.summarizeStartedAt = performance.now();
   setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
   updateTurnStatus("Summarizing results");
   for (let index = 0; index < prioritizedRawResults.length; index += 1) {
@@ -246,8 +252,9 @@ async function runBrowserPipeline(payload) {
     const summary = await summarizeSearchResult(aiSession, result);
     run.resultSummaries.push(summary);
     const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
-    setStageState("summarize", "active", progressText);
-    updateTurnStatus(`Summarizing results (${progressText})`);
+    const etaText = estimateLoopEta(run.summarizeStartedAt, index + 1, prioritizedRawResults.length);
+    setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
+    updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
   }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
   const modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
@@ -259,6 +266,7 @@ async function runBrowserPipeline(payload) {
   state.activeStageKey = "newsletter";
   setStageState("newsletter", "active", "Writing issue");
   updateTurnStatus("Generating newsletter");
+  run.newsletterStartedAt = performance.now();
   run.finalNewsletter = await generateNewsletter(aiSession, run);
   const stage4Seconds = Math.max(1, Math.round((run.writeTimings?.totalMs || 0) / 1000));
   setStageState("newsletter", "complete", `Draft complete (${stage4Seconds}s)`);
@@ -331,11 +339,14 @@ async function generateSearchPlan(aiSession, payload, queryCount) {
 
 async function fetchAllGoogleResults(queries, perQuery) {
   const allResults = [];
+  const startedAt = performance.now();
 
   for (let index = 0; index < queries.length; index += 1) {
     const query = queries[index];
-    setStageState("search", "active", `Query ${index + 1}/${queries.length}`);
-    updateTurnStatus(`Fetching Google results (${index + 1}/${queries.length})`);
+    const progressLabel = `Query ${index + 1}/${queries.length}`;
+    const etaText = estimateLoopEta(startedAt, index, queries.length);
+    setStageState("search", "active", `${progressLabel}${etaText ? ` · ETA ${etaText}` : ""}`);
+    updateTurnStatus(`Fetching Google results (${progressLabel}${etaText ? ` · ETA ${etaText}` : ""})`);
     const results = await fetchGoogleResults(query, perQuery);
     allResults.push(...results);
   }
@@ -451,35 +462,33 @@ async function summarizeSearchResult(aiSession, rawResult) {
 
 async function generateNewsletter(aiSession, run) {
   run.writeTimings = {};
-  run.writeDeadlineAt = Date.now() + WRITER_POLICY.stage4DeadlineMs;
   const newsletterStartedAt = performance.now();
   updateTurnStatus("Generating newsletter (framing)");
-  setStageState("newsletter", "active", "Framing");
+  setStageState("newsletter", "active", `Framing${estimateNewsletterEta(newsletterStartedAt, 0, 4)}`);
   const frameStartedAt = performance.now();
   const frame = await generateNewsletterFrame(aiSession, run);
-  ensureWriterDeadline(run, "framing");
+  setStageState("newsletter", "active", `Framing complete${estimateNewsletterEta(newsletterStartedAt, 1, 4)}`);
   run.writeTimings.frameMs = Math.round(performance.now() - frameStartedAt);
 
   updateTurnStatus("Generating newsletter (writing sections)");
-  setStageState("newsletter", "active", "Writing sections");
+  setStageState("newsletter", "active", `Writing sections${estimateNewsletterEta(newsletterStartedAt, 1, 4)}`);
   const bodyStartedAt = performance.now();
   let generatedMarkdown = await generateNewsletterBody(aiSession, run, frame);
-  ensureWriterDeadline(run, "drafting");
+  setStageState("newsletter", "active", `Sections complete${estimateNewsletterEta(newsletterStartedAt, 2, 4)}`);
   run.writeTimings.bodyMs = Math.round(performance.now() - bodyStartedAt);
   if (!generatedMarkdown) {
     updateTurnStatus("Generating newsletter (fallback pass)");
-    setStageState("newsletter", "active", "Fallback pass");
+    setStageState("newsletter", "active", `Fallback pass${estimateNewsletterEta(newsletterStartedAt, 2, 4)}`);
     const fallbackStartedAt = performance.now();
     generatedMarkdown = await generateWholeNewsletterFallback(aiSession, run, frame);
-    ensureWriterDeadline(run, "fallback");
+    setStageState("newsletter", "active", `Fallback complete${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
     run.writeTimings.fallbackMs = Math.round(performance.now() - fallbackStartedAt);
   }
   if (generatedMarkdown && shouldRunPolishPass(generatedMarkdown)) {
     updateTurnStatus("Generating newsletter (final edit pass)");
-    setStageState("newsletter", "active", "Final edit pass");
+    setStageState("newsletter", "active", `Final edit pass${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
     const polishStartedAt = performance.now();
     const polished = await polishNewsletterDraft(aiSession, run, frame, generatedMarkdown);
-    ensureWriterDeadline(run, "final edit");
     run.writeTimings.polishMs = Math.round(performance.now() - polishStartedAt);
     if (polished) {
       generatedMarkdown = polished;
@@ -667,7 +676,7 @@ async function generateNewsletterOpening(aiSession, run, frame) {
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
         maxNewTokens: aiTokenBudget(run, WRITER_POLICY.openingMaxTokens),
-        timeoutMs: writerTimeoutBudget(run, WRITER_POLICY.openingAttemptTimeoutMs),
+        timeoutMs: aiTimeoutBudget(run, WRITER_POLICY.openingAttemptTimeoutMs),
         doSample: true,
         temperature: 0.72,
         topP: 0.92,
@@ -699,7 +708,7 @@ async function generateNewsletterSection(aiSession, run, frame, heading, previou
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
         maxNewTokens: aiTokenBudget(run, WRITER_POLICY.sectionMaxTokens),
-        timeoutMs: writerTimeoutBudget(run, WRITER_POLICY.sectionAttemptTimeoutMs),
+        timeoutMs: aiTimeoutBudget(run, WRITER_POLICY.sectionAttemptTimeoutMs),
         doSample: true,
         temperature: 0.74,
         topP: 0.93,
@@ -1533,12 +1542,7 @@ async function loadBrowserSession() {
     try {
       beginBrowserLoad(candidate);
       const progressCallback = createBrowserLoadProgressHandler(candidate);
-      try {
-        return await loadTextOnlyBrowserSession(runtime, candidate, progressCallback);
-      } catch (textOnlyError) {
-        console.warn(`[Chronicle] Text-only load failed for ${candidate.label}. Falling back to multimodal.`, textOnlyError);
-      }
-      return await loadMultimodalBrowserSession(runtime, candidate, progressCallback);
+      return await loadTextOnlyBrowserSession(runtime, candidate, progressCallback);
     } catch (error) {
       lastError = error;
       state.browserRuntimeMessage = `Retrying with a lighter browser profile after ${candidate.label} failed.`;
@@ -1570,29 +1574,6 @@ async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) 
     runtimeKind: "text",
     codec: tokenizer,
     tokenizer,
-    model,
-    profile: candidate,
-  };
-}
-
-async function loadMultimodalBrowserSession(runtime, candidate, progressCallback) {
-  state.browserRuntimeMessage = `Local Gemma 3n multimodal runtime · ${candidate.label}`;
-  state.browserRuntimeProgressText = "Opening multimodal processor…";
-  renderHeaderStatus();
-  const processor = await runtime.AutoProcessor.from_pretrained(candidate.model, {
-    progress_callback: progressCallback,
-  });
-  const model = await runtime.AutoModelForImageTextToText.from_pretrained(
-    candidate.model,
-    {
-      ...candidate.multimodalModelOptions,
-      progress_callback: progressCallback,
-    },
-  );
-  return {
-    runtimeKind: "multimodal",
-    codec: processor,
-    processor,
     model,
     profile: candidate,
   };
@@ -1655,16 +1636,18 @@ function detectBrowserCapabilities() {
 }
 
 function calculateBrowserProfile(config) {
-  const maxSlices = 10;
+  const maxSlices = 16;
   let sliceCount = 1;
 
   if (config.hasWebGPU) {
     if (config.isMobile) {
-      sliceCount = config.deviceMemory >= 8 ? 2 : 1;
+      sliceCount = config.deviceMemory >= 8 ? 3 : 2;
     } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 12) {
-      sliceCount = 4;
+      sliceCount = 8;
     } else if (config.deviceMemory >= 16 && config.hardwareConcurrency >= 10) {
-      sliceCount = 2;
+      sliceCount = 6;
+    } else if (config.deviceMemory >= 8 && config.hardwareConcurrency >= 8) {
+      sliceCount = 4;
     }
   }
 
@@ -1794,6 +1777,7 @@ function beginBrowserLoad(candidate) {
   state.browserLoadCandidate = candidate.label;
   state.browserLoadProgressEntries = {};
   state.browserLastProgressAt = Date.now();
+  state.browserLoadStartedAt = Date.now();
   state.browserRuntimeStatus = "warming";
   state.browserRuntimeProgress = 0.06;
   state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
@@ -1827,7 +1811,8 @@ function updateBrowserLoadProgress(candidate, progressInfo = {}) {
   state.browserRuntimeStatus = "warming";
   state.browserRuntimeProgress = clampNumber(0.08 + average * 0.88, 0.06, 0.98);
   state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
-  state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}`;
+  const etaText = estimateEtaFromProgress(state.browserLoadStartedAt, state.browserRuntimeProgress);
+  state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}${etaText ? ` · ETA ${etaText}` : ""}`;
   renderHeaderStatus();
 }
 
@@ -2701,21 +2686,43 @@ function aiTimeoutBudget(run, fallback) {
   return Math.min(fallback, state.browserSession?.profile?.generationTimeoutMs || state.browserProfile?.generationTimeoutMs || fallback);
 }
 
-function writerTimeoutBudget(run, fallback) {
-  const remainingMs = Math.max(5000, (run.writeDeadlineAt || Date.now()) - Date.now());
-  return Math.min(
-    aiTimeoutBudget(run, fallback),
-    remainingMs,
-  );
+function estimateLoopEta(startMs, completed, total) {
+  if (!startMs || completed <= 0 || total <= completed) {
+    return "";
+  }
+  const elapsedMs = Math.max(1, performance.now() - startMs);
+  const avgPerUnitMs = elapsedMs / completed;
+  const remainingMs = Math.max(0, Math.round(avgPerUnitMs * (total - completed)));
+  return formatEta(remainingMs);
 }
 
-function ensureWriterDeadline(run, stepName) {
-  if (!run.writeDeadlineAt) {
-    return;
+function estimateNewsletterEta(startMs, completedSteps, totalSteps) {
+  const eta = estimateLoopEta(startMs, completedSteps, totalSteps);
+  return eta ? ` · ETA ${eta}` : "";
+}
+
+function estimateEtaFromProgress(startedAtMs, progress) {
+  const ratio = clampNumber(progress, 0, 1);
+  if (!startedAtMs || ratio <= 0.02 || ratio >= 0.995) {
+    return "";
   }
-  if (Date.now() > run.writeDeadlineAt) {
-    throw new Error(`Chronicle timed out during ${stepName}. Please retry with fewer results or lower depth.`);
+  const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+  const projectedTotalMs = elapsedMs / ratio;
+  const remainingMs = Math.max(0, Math.round(projectedTotalMs - elapsedMs));
+  return formatEta(remainingMs);
+}
+
+function formatEta(milliseconds) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (!seconds) {
+    return "";
   }
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
 function withTimeout(promise, timeoutMs, message) {
