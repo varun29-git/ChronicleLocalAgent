@@ -6,80 +6,88 @@
   <title>Chronicle</title>
   <meta
     name="description"
-    content="Chronicle is a local-first newsletter chatbot that shows the full search and research log as it works."
+    content="Chronicle is a browser-only newsletter engine that researches, summarizes, and writes on device."
   >
   <link rel="stylesheet" href="/static/chronicle.css">
 </head>
 <body>
-  <div class="chat-shell">
-    <header class="app-header">
-      <div class="brand-block">
-        <p class="app-kicker">Chronicle</p>
-        <h1>Newsletter engine</h1>
-        <p class="brand-copy">Local-first research, reasoning, and issue drafting on device.</p>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <p class="brand-mark">Chronicle</p>
+        <p class="brand-subtitle">Browser-only newsletter studio</p>
       </div>
-      <div class="runtime-block">
-        <p class="runtime-label">Runtime</p>
-        <span class="status-pill" id="status-pill">Checking runtime</span>
-        <p class="runtime-copy" id="status-copy">Connecting to the local model runtime…</p>
+
+      <div class="runtime-strip">
+        <div class="runtime-row">
+          <div class="runtime-copy">
+            <p class="runtime-label">Browser model</p>
+            <p class="runtime-title" id="status-pill">Preparing Gemma 3n</p>
+          </div>
+          <p class="runtime-text" id="status-copy">Loading local model files in the browser.</p>
+        </div>
+
+        <div class="runtime-progress" aria-hidden="true">
+          <div class="runtime-progress-fill" id="runtime-progress-fill"></div>
+        </div>
+
+        <p class="runtime-progress-text" id="runtime-progress-text">Starting warmup…</p>
       </div>
     </header>
 
-    <main class="chat-panel">
-      <section class="chat-thread" id="chat-thread" aria-live="polite" aria-label="Chronicle conversation"></section>
+    <main class="workspace">
+      <section class="chat-thread" id="chat-thread" aria-live="polite" aria-label="Chronicle conversation">
+        <div class="empty-state" id="empty-state">
+          <p class="empty-eyebrow">Chronicle</p>
+          <h1>What should Chronicle cover?</h1>
+          <p class="empty-copy">Start with a topic, choose a reasoning mode, and let the browser research and write the issue locally.</p>
+        </div>
+      </section>
+    </main>
 
-      <form id="composer-form" class="composer-form">
-        <div class="composer-input-row">
-          <textarea
-            id="brief"
-            name="brief"
-            rows="4"
-            placeholder="Ask for a newsletter, for example: What changed in European AI policy this week?"
-            required
-          ></textarea>
-          <button type="submit" class="send-button" id="generate-button">Send</button>
+    <form id="composer-form" class="composer-shell">
+      <div class="composer-card">
+        <textarea
+          id="brief"
+          name="brief"
+          rows="4"
+          placeholder="Enter a topic, for example: What changed in European AI policy this week?"
+          required
+        ></textarea>
+
+        <div class="composer-controls">
+          <label class="chip-field">
+            <span>Depth</span>
+            <select name="depth">
+              <option value="low">Low</option>
+              <option value="medium" selected>Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+
+          <label class="chip-field">
+            <span>Reasoning mode</span>
+            <select name="explanation_style" id="explanation-style">
+              <option value="concise" selected>Concise</option>
+              <option value="feynman">Feynman</option>
+              <option value="soc">Socratic</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+
+          <button type="submit" class="send-button" id="generate-button">Generate</button>
         </div>
 
-        <details class="advanced-controls">
-          <summary>Advanced</summary>
-
-          <div class="composer-controls">
-            <label class="control-field">
-              <span>Depth</span>
-              <select name="depth">
-                <option value="low">Low</option>
-                <option value="medium" selected>Medium</option>
-                <option value="high">High</option>
-              </select>
-            </label>
-
-            <label class="control-field">
-              <span>Style</span>
-              <select name="explanation_style" id="explanation-style">
-                <option value="concise" selected>Concise</option>
-                <option value="feynman">Feynman</option>
-                <option value="soc">Socratic</option>
-                <option value="custom">Custom</option>
-              </select>
-            </label>
-
-            <label class="control-field">
-              <span>Days</span>
-              <input type="number" name="days" min="1" max="30" value="7">
-            </label>
-          </div>
-
-          <label class="control-field control-field--full is-hidden" id="custom-style-field">
-            <span>Custom style instructions</span>
-            <textarea
-              name="style_instructions"
-              rows="3"
-              placeholder="Example: aggressive synthesis, short paragraphs, zero fluff"
-            ></textarea>
-          </label>
-        </details>
-      </form>
-    </main>
+        <label class="custom-style-field is-hidden" id="custom-style-field">
+          <span>Custom style instructions</span>
+          <textarea
+            name="style_instructions"
+            rows="3"
+            placeholder="Example: analytical, compressed, sharp transitions, zero fluff"
+          ></textarea>
+        </label>
+      </div>
+    </form>
   </div>
 
   <script src="/static/chronicle.js" defer></script>

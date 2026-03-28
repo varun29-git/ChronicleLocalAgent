@@ -108,44 +108,20 @@ SEARCH_NOISE_WORDS = {
     "yesterday",
 }
 
-TOPIC_ALIASES = {
-    "elon": {
-        "canonical": "Elon Musk",
-        "title": "Elon Musk",
-        "include_terms": ("elon", "musk", "tesla", "spacex", "x", "neuralink"),
-        "exclude_terms": ("university", "college", "campus", "student", "athletics", "mentor"),
-    },
-    "musk": {
-        "canonical": "Elon Musk",
-        "title": "Elon Musk",
-        "include_terms": ("elon", "musk", "tesla", "spacex", "x", "neuralink"),
-        "exclude_terms": ("university", "college", "campus", "student", "athletics", "mentor"),
-    },
-    "trump": {
-        "canonical": "Donald Trump",
-        "title": "Donald Trump",
-        "include_terms": ("donald", "trump", "president", "white house"),
-        "exclude_terms": (),
-    },
-    "modi": {
-        "canonical": "Narendra Modi",
-        "title": "Narendra Modi",
-        "include_terms": ("narendra", "modi", "india", "indian"),
-        "exclude_terms": (),
-    },
-    "trudeau": {
-        "canonical": "Justin Trudeau",
-        "title": "Justin Trudeau",
-        "include_terms": ("justin", "trudeau", "canada", "canadian"),
-        "exclude_terms": (),
-    },
-    "carney": {
-        "canonical": "Mark Carney",
-        "title": "Mark Carney",
-        "include_terms": ("mark", "carney", "canada", "canadian"),
-        "exclude_terms": (),
-    },
-}
+BRIEF_SCAFFOLD_PATTERNS = (
+    r"^(what changed in|what changed|tell me about|show me|give me a newsletter on|give me an update on|newsletter on|brief on|update on|latest on)\b",
+    r"\b(this week|this month|today|latest developments?|key news|analysis and outlook|analysis|updates?|last \d+ days?|over the last \d+ days?)\b",
+)
+
+LOW_SIGNAL_SOURCE_PATTERNS = (
+    r"\b(opinion|editorial|op-ed|column)\b",
+    r"\b(university|college|campus|student|athletics|obituary|in memory|mentor)\b",
+)
+
+HIGH_SIGNAL_SOURCE_PATTERNS = (
+    r"\b(reuters|ap news|associated press|bloomberg|financial times|wall street journal|bbc|economist|politico|ft\.com)\b",
+    r"\b(white house|parliament|commission|ministry|government|state department|eu|european parliament|european commission)\b",
+)
 
 EXPLANATION_STYLE_GUIDANCE = {
     "concise": "Be tight, selective, and high-signal. Short paragraphs. No filler.",
@@ -626,14 +602,15 @@ def build_fallback_research_plan(brief, days, query_limit, depth):
     topic_profile = resolve_topic_profile(normalized_brief)
     focus_phrase = topic_profile["search_focus"]
     query_candidates = [
-        topic_profile["canonical"],
+        focus_phrase,
         focus_phrase,
         f"{focus_phrase} news" if focus_phrase else "",
         f"{focus_phrase} latest" if focus_phrase else "",
+        f"{focus_phrase} developments" if focus_phrase else "",
         f"{focus_phrase} this week" if focus_phrase and days <= 10 else "",
         f"{focus_phrase} last {days} days" if focus_phrase and days > 10 else "",
         f"{focus_phrase} analysis" if focus_phrase else "",
-        normalized_brief,
+        normalized_brief if normalized_brief.lower() != focus_phrase.lower() else "",
         *build_search_query_variants(focus_phrase or normalized_brief),
     ]
 
@@ -676,19 +653,7 @@ def generate_fallback_title(brief):
 
 
 def derive_search_focus_phrase(text):
-    topic_profile = resolve_topic_profile(text)
-    if topic_profile["canonical"] and topic_profile["canonical"].lower() != clean_text(text).lower():
-        return topic_profile["search_focus"]
-    keywords = extract_search_keywords(text)
-    if keywords:
-        return " ".join(keywords[:4])
-    stripped = re.sub(
-        r"\b(what changed in|what changed|tell me about|show me|latest developments|key news|analysis and outlook)\b",
-        " ",
-        str(text or ""),
-        flags=re.IGNORECASE,
-    )
-    return clean_text(stripped)
+    return build_focus_phrase(text)
 
 
 def extract_search_keywords(text):
@@ -752,15 +717,11 @@ def build_search_query_variants(query):
 
 def resolve_topic_profile(brief):
     normalized_brief = clean_text(brief)
-    lowered = normalized_brief.lower()
-    keywords = extract_search_keywords(normalized_brief)
-    alias_key = lowered if lowered in TOPIC_ALIASES else (keywords[0] if len(keywords) == 1 and keywords[0] in TOPIC_ALIASES else "")
-    alias = TOPIC_ALIASES.get(alias_key, {})
-
-    canonical = clean_text(alias.get("canonical", "")) or normalized_brief
-    title = clean_text(alias.get("title", "")) or canonical
-    include_terms = tuple(alias.get("include_terms", ()) or tuple(keywords[:4]))
-    exclude_terms = tuple(alias.get("exclude_terms", ()))
+    focus_phrase = build_focus_phrase(normalized_brief) or normalized_brief
+    canonical = clean_text(focus_phrase or normalized_brief)
+    title = format_focus_title(canonical)
+    include_terms = tuple(extract_search_keywords(canonical)[:6] or extract_search_keywords(normalized_brief)[:6])
+    exclude_terms = ("university", "college", "campus", "student", "athletics", "obituary", "mentor")
 
     return {
         "canonical": canonical,
@@ -769,6 +730,43 @@ def resolve_topic_profile(brief):
         "include_terms": include_terms,
         "exclude_terms": exclude_terms,
     }
+
+
+def build_focus_phrase(text):
+    original = clean_text(text)
+    cleaned = strip_brief_scaffolding(original)
+    if not cleaned:
+        return original
+
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'.-]*", cleaned)
+    if 1 <= len(words) <= 6:
+        return " ".join(words)
+
+    keywords = extract_search_keywords(cleaned)
+    if keywords:
+        return " ".join(keywords[:5])
+    return cleaned
+
+
+def strip_brief_scaffolding(text):
+    value = clean_text(text)
+    if not value:
+        return ""
+
+    cleaned = value
+    for pattern in BRIEF_SCAFFOLD_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[?]", " ", cleaned)
+    cleaned = clean_text(cleaned)
+    return cleaned or value
+
+
+def format_focus_title(text):
+    words = [word for word in re.split(r"\s+", clean_text(text)) if word]
+    if not words:
+        return "Weekly Newsletter"
+    compact = " ".join(words[:5])
+    return compact.title()
 
 
 def fetch_market_snapshot(brief):
@@ -1031,12 +1029,69 @@ def build_mode_system_prompt(explanation_style, custom_style_instructions):
     )
 
 
+def curate_sources_for_issue(brief, collected_sources, limit=6):
+    topic_profile = resolve_topic_profile(brief)
+    ranked = []
+    for index, source in enumerate(collected_sources):
+        item = dict(source)
+        item["curation_score"] = score_issue_source(item, topic_profile, index)
+        ranked.append(item)
+
+    ranked.sort(key=lambda item: item["curation_score"], reverse=True)
+    threshold = 8.0 if topic_profile.get("include_terms") else 6.0
+    preferred = [item for item in ranked if item["curation_score"] >= threshold]
+    pool = preferred or ranked
+
+    curated = []
+    seen = set()
+    for source in pool:
+        key = source_identity(source)
+        if key in seen:
+            continue
+        seen.add(key)
+        curated.append(source)
+        if len(curated) >= limit:
+            break
+    return curated
+
+
+def score_issue_source(source, topic_profile, index):
+    title = clean_source_title(source.get("title", ""))
+    text = f"{title} {source.get('snippet', '')} {source.get('source_text', '')}".lower()
+    include_terms = topic_profile.get("include_terms", ())
+    exclude_terms = topic_profile.get("exclude_terms", ())
+    include_hits = sum(1 for term in include_terms if term and term.lower() in text)
+    exclude_hits = sum(1 for term in exclude_terms if term and term.lower() in text)
+
+    score = 12.0 - (index * 0.35)
+    score += include_hits * 2.5
+    if include_terms and include_hits == 0:
+        score -= 5.5
+    score -= exclude_hits * 6.0
+    if normalize_source_phrase(title) == normalize_source_phrase(topic_profile.get("canonical", "")):
+        score -= 9.0
+
+    if source.get("article_text"):
+        score += 1.6
+    elif source.get("snippet"):
+        score += 0.8
+
+    for pattern in LOW_SIGNAL_SOURCE_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            score -= 4.5
+    for pattern in HIGH_SIGNAL_SOURCE_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            score += 1.8
+
+    return round(score, 2)
+
+
 def build_source_block(collected_sources):
     if not collected_sources:
         return "No web sources were collected."
 
     blocks = []
-    for index, source in enumerate(collected_sources[:4], start=1):
+    for index, source in enumerate(collected_sources[:5], start=1):
         title = clean_source_title(source.get("title", ""))
         evidence = build_source_text(source, source.get("article_text", ""))
         evidence = compact_evidence_text(evidence, 240) or title
@@ -1056,7 +1111,8 @@ def compose_newsletter(
     newsletter_tokens,
 ):
     system_prompt = build_mode_system_prompt(explanation_style, custom_style_instructions)
-    source_block = build_source_block(collected_sources)
+    curated_sources = curate_sources_for_issue(brief, collected_sources, limit=5)
+    source_block = build_source_block(curated_sources)
     market_block = json.dumps(market_snapshot, ensure_ascii=True) if market_snapshot else "None."
     sections_block = " | ".join(plan["sections"][:3])
 
@@ -1094,37 +1150,28 @@ Instructions:
 
 
 def render_deterministic_newsletter(plan, brief, collected_sources, explanation_style, market_snapshot):
-    lead_sources = collected_sources[:3]
+    selected_sources = curate_sources_for_issue(brief, collected_sources, limit=5)
+    topic_profile = resolve_topic_profile(brief)
     title = plan["title"]
+    focus = topic_profile["canonical"] or brief
     sections = plan["sections"][:3]
+    theme_terms = extract_theme_terms(selected_sources, topic_profile, limit=3)
+    opening = build_issue_lead(focus, selected_sources, theme_terms, explanation_style)
 
-    if lead_sources:
-        lead_titles = [clean_source_title(source["title"]) for source in lead_sources[:2]]
-        opening = (
-            f"The clearest signal around {brief} is not any one isolated headline, "
-            f"but the way {lead_titles[0]}{' and ' + lead_titles[1] if len(lead_titles) > 1 else ''} "
-            "are pulling the story into a single frame."
-        )
+    if explanation_style == "soc":
+        section_titles = [
+            "What is actually happening?",
+            "Why does it matter now?",
+            "What should readers watch next?",
+        ]
     else:
-        opening = (
-            f"External reporting on {brief} was thin in this run, so this issue stays close to the verified brief "
-            "and avoids overclaiming."
-        )
+        section_titles = sections
 
     body = [f"# {title}", "", opening, ""]
-    for index, section in enumerate(sections):
+    for index, section in enumerate(section_titles):
         body.append(f"## {section}")
         body.append("")
-        paired_sources = lead_sources[index:index + 2] or lead_sources[:1]
-        if paired_sources:
-            lines = []
-            for source_index, source in enumerate(paired_sources, start=1):
-                evidence = build_source_text(source, source.get("article_text", ""))
-                citation = collected_sources.index(source) + 1
-                lines.append(f"{evidence} [{citation}]")
-            body.append(" ".join(lines))
-        else:
-            body.append(f"This section remains provisional because Chronicle did not collect enough usable evidence for {brief}.")
+        body.append(build_issue_section(focus, section, selected_sources, index, theme_terms, explanation_style))
         body.append("")
 
     if market_snapshot:
@@ -1137,14 +1184,176 @@ def render_deterministic_newsletter(plan, brief, collected_sources, explanation_
         )
         body.append("")
 
-    if explanation_style == "soc":
-        body.insert(4, "What is the real question here? It is whether the visible headlines add up to one durable direction or just a noisy burst.")
-        body.insert(5, "")
-    elif explanation_style == "feynman":
-        body.insert(4, "Think of the reporting window like a map: each headline is a pin, and the pattern matters more than any single pin.")
-        body.insert(5, "")
-
     return "\n".join(body).strip()
+
+
+def build_issue_lead(focus, selected_sources, theme_terms, explanation_style):
+    if not selected_sources:
+        return (
+            f"This issue stays deliberately conservative because Chronicle did not verify enough reporting on {focus} "
+            "to support a stronger narrative."
+        )
+
+    lead_titles = [clean_source_title(source.get("title", "")) for source in selected_sources[:2]]
+    theme_clause = derive_theme_clause(selected_sources, focus, theme_terms)
+
+    if explanation_style == "feynman":
+        return (
+            f"In plain English, the story around {focus} this week is about {theme_clause}. "
+            f"The strongest overlap sits between {lead_titles[0]} [1]"
+            f"{f' and {lead_titles[1]} [2]' if len(lead_titles) > 1 else ''}, "
+            f"which {'together point' if len(lead_titles) > 1 else 'points'} to the same underlying shift."
+        )
+
+    if explanation_style == "soc":
+        return (
+            f"What is the core idea here? It is that coverage around {focus} is converging on {theme_clause}, "
+            f"with {lead_titles[0]} [1]{f' and {lead_titles[1]} [2]' if len(lead_titles) > 1 else ''} "
+            "acting as the clearest anchors."
+        )
+
+    return (
+        f"The clearest signal around {focus} this week is not one isolated headline, but a broader convergence around {theme_clause}. "
+        f"The reporting is anchored by {lead_titles[0]} [1]"
+        f"{f' and {lead_titles[1]} [2]' if len(lead_titles) > 1 else ''}, "
+        f"which {'point' if len(lead_titles) > 1 else 'points'} to the same center of gravity."
+    )
+
+
+def build_issue_section(focus, section_name, selected_sources, index, theme_terms, explanation_style):
+    if not selected_sources:
+        return f"Chronicle did not collect enough usable evidence on {focus} to make this section stronger."
+
+    primary = selected_sources[index] if index < len(selected_sources) else selected_sources[0]
+    if len(selected_sources) == 1:
+        primary_citation = 1
+        primary_title = clean_source_title(primary.get("title", ""))
+        primary_signal = describe_source_signal(primary, primary_citation)
+        theme_clause = derive_theme_clause(selected_sources, focus, theme_terms)
+        lowered = section_name.lower()
+
+        if "what happened" in lowered or "actually happening" in lowered:
+            return (
+                f"{primary_signal} With only one strong source in the current reporting window, Chronicle treats this as the clearest verified signal around {focus}."
+            )
+        if "why it matters" in lowered or "matter now" in lowered:
+            explainer = (
+                "In practical terms, the constraint here is confidence, not relevance. "
+                if explanation_style == "feynman"
+                else "The limitation here is evidence depth, not topic importance. "
+            )
+            return (
+                f"{explainer}{primary_title} [{primary_citation}] still suggests that the live conversation is organizing around {theme_clause}, "
+                f"so the right read is cautious synthesis rather than a headline dump."
+            )
+        return (
+            f"The next thing to watch is whether follow-on reporting reinforces or complicates {primary_title} [{primary_citation}]. "
+            f"If it does, Chronicle should treat {theme_clause} as the emerging frame around {focus}."
+        )
+
+    secondary = selected_sources[index + 1] if index + 1 < len(selected_sources) else selected_sources[min(1, len(selected_sources) - 1)]
+    primary_citation = selected_sources.index(primary) + 1
+    secondary_citation = selected_sources.index(secondary) + 1
+    primary_signal = describe_source_signal(primary, primary_citation)
+    secondary_signal = describe_source_signal(secondary, secondary_citation)
+    theme_clause = derive_theme_clause(selected_sources, focus, theme_terms)
+    lowered = section_name.lower()
+
+    if "what happened" in lowered or "actually happening" in lowered:
+        return (
+            f"{primary_signal} {secondary_signal} Taken together, those developments suggest that the reporting window around {focus} "
+            f"is organizing itself around {theme_clause}, not scattering in unrelated directions."
+        )
+
+    if "why it matters" in lowered or "matter now" in lowered:
+        explainer = (
+            f"In practical terms, that matters because it changes how readers should interpret the current moment around {focus}. "
+            if explanation_style == "feynman"
+            else f"That matters because it turns a noisy stream of updates into a clearer narrative about {focus}. "
+        )
+        return (
+            f"{explainer}The value of {clean_source_title(primary.get('title', ''))} [{primary_citation}] is that it helps locate the durable pattern, "
+            f"while {clean_source_title(secondary.get('title', ''))} [{secondary_citation}] shows the same pattern from a different angle."
+        )
+
+    return (
+        f"The next thing to watch is whether the themes around {theme_clause} keep strengthening in the next reporting cycle. "
+        f"If the line from {clean_source_title(primary.get('title', ''))} [{primary_citation}] "
+        f"to {clean_source_title(secondary.get('title', ''))} [{secondary_citation}] continues to hold, "
+        f"Chronicle should treat that as the durable frame for {focus}, not a temporary burst of attention."
+    )
+
+
+def describe_source_signal(source, citation):
+    summary = compact_evidence_text(
+        source.get("article_text") or source.get("snippet") or source.get("source_text") or "",
+        180,
+    )
+    title = clean_source_title(source.get("title", ""))
+
+    if summary and normalize_source_phrase(summary) != normalize_source_phrase(title):
+        return f"{summary} [{citation}]"
+
+    if title.endswith("?"):
+        return f"One strand of coverage asked whether {title[:-1]} [{citation}]."
+
+    lowered = title.lower()
+    if lowered.startswith("opinion |"):
+        return f"A commentary line argued \"{title.split('|', 1)[-1].strip()}\" [{citation}]."
+
+    return f"One verified strand of coverage centered on \"{title}\" [{citation}]."
+
+
+def extract_theme_terms(selected_sources, topic_profile, limit=3):
+    stopwords = SEARCH_NOISE_WORDS | {
+        "amid",
+        "around",
+        "could",
+        "from",
+        "more",
+        "says",
+        "week",
+        "weeks",
+        "will",
+    }
+    excluded = set(term.lower() for term in topic_profile.get("include_terms", ()))
+    scores = {}
+
+    for source in selected_sources:
+        text = f"{clean_source_title(source.get('title', ''))} {source.get('snippet', '')}"
+        seen = set()
+        for word in re.findall(r"[a-z][a-z0-9-]{2,}", text.lower()):
+            if word in stopwords or word in excluded or word in seen:
+                continue
+            seen.add(word)
+            scores[word] = scores.get(word, 0) + 1
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    return [term for term, _score in ranked[:limit]]
+
+
+def format_theme_clause(theme_terms, focus):
+    if len(theme_terms) >= 2:
+        return f"{theme_terms[0]} and {theme_terms[1]}"
+    if theme_terms:
+        return theme_terms[0]
+    return focus
+
+
+def derive_theme_clause(selected_sources, focus, theme_terms):
+    title_text = " ".join(clean_source_title(source.get("title", "")) for source in selected_sources[:4]).lower()
+    heuristics = (
+        (r"\b(ai act|implementation|compliance|deadline|delay|regulating|regulation)\b", "implementation and enforcement"),
+        (r"\b(judge|jury|lawsuit|dismissed|court|trial|legal)\b", "legal and regulatory pressure"),
+        (r"\b(war|strait|parliament|crisis|iran|middle east|phone call|diplomat)\b", "foreign-policy positioning"),
+        (r"\b(advertising|creator|platform|x advertising|backlash|product|tunnel)\b", "business strategy and platform control"),
+        (r"\b(economy|economic|inflation|tariff|market)\b", "economic pressure"),
+    )
+
+    for pattern, label in heuristics:
+        if re.search(pattern, title_text, flags=re.IGNORECASE):
+            return label
+    return format_theme_clause(theme_terms, focus)
 
 
 def finalize_newsletter_markdown(markdown, plan, collected_sources, market_snapshot):
@@ -1259,11 +1468,17 @@ def run_newsletter_pipeline(
             collected_sources.append(record)
             print(f"  Source ready: {record['title']}")
 
+    selected_sources = curate_sources_for_issue(
+        brief,
+        collected_sources,
+        limit=6 if depth == "high" else 5,
+    )
+
     try:
         newsletter_markdown = compose_newsletter(
             brief,
             plan,
-            collected_sources,
+            selected_sources,
             days,
             market_snapshot,
             depth,
@@ -1276,7 +1491,7 @@ def run_newsletter_pipeline(
         newsletter_markdown = render_deterministic_newsletter(
             plan,
             brief,
-            collected_sources,
+            selected_sources,
             explanation_style,
             market_snapshot,
         )
@@ -1284,7 +1499,7 @@ def run_newsletter_pipeline(
     newsletter_markdown = finalize_newsletter_markdown(
         newsletter_markdown,
         plan,
-        collected_sources,
+        selected_sources,
         market_snapshot,
     )
     output_files = write_newsletter_files(output_dir, plan["title"], newsletter_markdown)

@@ -1,56 +1,75 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
-const state = {
-  serverRuntime: null,
-  browserConfig: null,
-  browserCapabilities: null,
-  browserSession: null,
-  browserSessionPromise: null,
-  transformersRuntimePromise: null,
-  browserWarmStarted: false,
-  activeJobId: null,
-  pollTimer: null,
-  currentTurn: null,
-  hasRenderedIntro: false,
+const MODEL_CANDIDATES = [
+  "onnx-community/gemma-3n-E2B-it-ONNX",
+  "gemma-3n-E2B-it-ONNX",
+];
+
+const GEMMA3N_DTYPE_MAP = {
+  decoder_model_merged: "q4",
+  embed_tokens: "q4",
+  audio_encoder: "q4f16",
+  vision_encoder: "uint8",
+};
+
+const GEMMA3N_TEXT_DTYPE_MAP = {
+  decoder_model_merged: "q4",
+  embed_tokens: "q4",
+};
+
+const DEPTH_CONFIG = {
+  low: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
+  medium: { queryCount: 4, resultsPerQuery: 3, summarizeCount: 6 },
+  high: { queryCount: 6, resultsPerQuery: 4, summarizeCount: 8 },
 };
 
 const TURN_STAGES = [
-  { key: "research", index: "01", title: "Extracting web info" },
-  { key: "brain", index: "02", title: "Sending to Chronicle brain" },
-  { key: "generate", index: "03", title: "Generating newsletter" },
+  { key: "query", index: "01", title: "Generate search queries" },
+  { key: "search", index: "02", title: "Fetch Google results" },
+  { key: "summarize", index: "03", title: "Summarize results" },
+  { key: "newsletter", index: "04", title: "Generate newsletter" },
+  { key: "render", index: "05", title: "Render and export" },
 ];
 
-const TOPIC_ALIASES = {
-  elon: {
-    canonical: "Elon Musk",
-    include: ["elon", "musk", "tesla", "spacex", "x", "neuralink"],
-    exclude: ["university", "college", "campus", "student", "athletics", "mentor"],
-  },
-  musk: {
-    canonical: "Elon Musk",
-    include: ["elon", "musk", "tesla", "spacex", "x", "neuralink"],
-    exclude: ["university", "college", "campus", "student", "athletics", "mentor"],
-  },
-  trump: {
-    canonical: "Donald Trump",
-    include: ["donald", "trump", "president", "white house"],
-    exclude: [],
-  },
-  modi: {
-    canonical: "Narendra Modi",
-    include: ["narendra", "modi", "india", "indian"],
-    exclude: [],
-  },
-  trudeau: {
-    canonical: "Justin Trudeau",
-    include: ["justin", "trudeau", "canada", "canadian"],
-    exclude: [],
-  },
-  carney: {
-    canonical: "Mark Carney",
-    include: ["mark", "carney", "canada", "canadian"],
-    exclude: [],
-  },
+const MODE_COPY = {
+  concise: "Write a sharp, selective editorial brief with minimal filler.",
+  feynman: "Explain clearly in plain language, teaching the reader without sounding simplistic.",
+  soc: "Use a Socratic structure, with section headings phrased as sharp questions answered clearly.",
+};
+
+const WRITER_POLICY = {
+  name: "balanced_fast",
+  openingEvidenceCount: 2,
+  sectionEvidenceCount: 2,
+  openingMaxTokens: 180,
+  sectionMaxTokens: 260,
+  fallbackVariantChars: [120, 84],
+  fallbackTimeoutMs: 55000,
+  fallbackMaxTokens: { medium: 520, compact: 460 },
+  polishOnPassOnly: true,
+  polishMaxTokens: 520,
+  polishTimeoutMs: 50000,
+  stage4DeadlineMs: 95000,
+  openingAttemptTimeoutMs: 22000,
+  sectionAttemptTimeoutMs: 22000,
+};
+
+const state = {
+  browserCapabilities: null,
+  browserProfile: null,
+  browserSession: null,
+  browserSessionPromise: null,
+  browserWarmStarted: false,
+  browserRuntimeStatus: "warming",
+  browserRuntimeMessage: "Warming the local browser model…",
+  browserRuntimeProgress: 0.04,
+  browserRuntimeProgressText: "Starting warmup…",
+  browserLoadProgressEntries: {},
+  browserLoadCandidate: "",
+  browserLastProgressAt: 0,
+  transformersRuntimePromise: null,
+  currentTurn: null,
+  activeStageKey: null,
 };
 
 const elements = {};
@@ -60,14 +79,17 @@ document.addEventListener("DOMContentLoaded", () => {
   bindComposer();
   hydrateApp().catch((error) => {
     console.error(error);
-    appendSystemMessage(error.message || "Chronicle failed to initialize.");
+    finishTurnWithError(error.message || "Chronicle failed to initialize.");
   });
 });
 
 function cacheElements() {
   elements.statusPill = document.getElementById("status-pill");
   elements.statusCopy = document.getElementById("status-copy");
+  elements.runtimeProgressFill = document.getElementById("runtime-progress-fill");
+  elements.runtimeProgressText = document.getElementById("runtime-progress-text");
   elements.chatThread = document.getElementById("chat-thread");
+  elements.emptyState = document.getElementById("empty-state");
   elements.composerForm = document.getElementById("composer-form");
   elements.brief = document.getElementById("brief");
   elements.explanationStyle = document.getElementById("explanation-style");
@@ -83,28 +105,21 @@ function bindComposer() {
   elements.composerForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const payload = buildPayload();
-    if (!payload.brief) {
+    try {
+      validatePayload(payload);
+    } catch (error) {
+      appendSystemMessage(error.message || "Chronicle needs a valid topic.");
       return;
     }
 
-    stopPolling();
     startNewTurn(payload.brief);
     setGenerateBusy(true);
 
     try {
-      await runBrowserGeneration(payload);
+      await runBrowserPipeline(payload);
     } catch (error) {
       console.error(error);
-      appendLogLines([
-        `Browser runtime failed: ${error.message || "Unknown error"}`,
-      ]);
-
-      if (canUseServerFallback()) {
-        updateTurnStatus("Browser runtime failed. Falling back to the host runtime.");
-        await startServerGeneration(payload);
-      } else {
-        finishTurnWithError(error.message || "Chronicle could not generate the issue on this device.");
-      }
+      finishTurnWithError(error.message || "Chronicle could not complete the browser-only run.");
     }
   });
 }
@@ -112,386 +127,2132 @@ function bindComposer() {
 function buildPayload() {
   const formData = new FormData(elements.composerForm);
   return {
-    brief: String(formData.get("brief") || "").trim(),
-    depth: String(formData.get("depth") || "medium").trim(),
-    explanation_style: String(formData.get("explanation_style") || "concise").trim(),
-    style_instructions: String(formData.get("style_instructions") || "").trim(),
-    days: Number(formData.get("days") || 7),
+    brief: cleanText(formData.get("brief") || ""),
+    depth: cleanText(formData.get("depth") || "medium").toLowerCase(),
+    explanation_style: cleanText(formData.get("explanation_style") || "concise").toLowerCase(),
+    style_instructions: cleanText(formData.get("style_instructions") || ""),
   };
+}
+
+function validatePayload(payload) {
+  if (!payload.brief) {
+    throw new Error("Enter a topic before starting Chronicle.");
+  }
+
+  if (payload.explanation_style === "custom" && !payload.style_instructions) {
+    throw new Error("Add custom style instructions or switch to another reasoning mode.");
+  }
 }
 
 async function hydrateApp() {
   toggleCustomStyleField(false);
-  const statusResponse = await fetchJSON("/api/status");
-  applyStatus(statusResponse);
-
-  if (!state.hasRenderedIntro) {
-    appendAssistantMessage(buildIntroMessage());
-    state.hasRenderedIntro = true;
-  }
-
-  if (statusResponse.active_job) {
-    startRecoveredTurn();
-    setGenerateBusy(true);
-    renderJobState(statusResponse.active_job);
-    startPolling(statusResponse.active_job.id);
-  }
-}
-
-function applyStatus(statusResponse) {
-  state.serverRuntime = statusResponse.runtime;
-  state.browserConfig = statusResponse.browser_ai;
-  state.browserCapabilities = detectBrowserCapabilities(statusResponse.browser_ai);
+  state.browserCapabilities = detectBrowserCapabilities();
+  state.browserProfile = calculateBrowserProfile(state.browserCapabilities);
   renderHeaderStatus();
   warmBrowserSessionInBackground();
 }
 
 function renderHeaderStatus() {
-  const runtime = state.serverRuntime;
-  const browserConfig = state.browserConfig;
-  const browserCapabilities = state.browserCapabilities;
-  const browserReady = Boolean(browserConfig?.local_model_ready);
-  const supportsSlicing = Boolean(browserConfig?.supports_slicing);
-  const primaryProfile = browserCapabilities?.candidates?.[0];
-  const modelName = browserConfig?.display_name || "Gemma 3n adaptive";
+  const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU" : "WASM";
+  const profileLabel = state.browserProfile?.label || "Adaptive slice";
+  const progress = clampNumber(
+    state.browserRuntimeStatus === "ready" ? 1 : state.browserRuntimeProgress || 0.04,
+    0.04,
+    1,
+  );
 
-  if (browserReady) {
-    setStatusPill(browserCapabilities?.hasWebGPU ? "Browser ready" : "WASM ready", "");
-  } else if (runtime?.dependencies_ready && runtime?.model_ready) {
-    setStatusPill("Server fallback only", "is-warm");
-  } else {
-    setStatusPill("Runtime incomplete", "is-danger");
+  if (elements.runtimeProgressFill) {
+    elements.runtimeProgressFill.style.width = `${Math.round(progress * 100)}%`;
+  }
+  if (elements.runtimeProgressText) {
+    elements.runtimeProgressText.textContent = state.browserRuntimeProgressText || "Preparing model files…";
   }
 
-  if (browserReady && primaryProfile) {
-    const runtimeMode = browserCapabilities.hasWebGPU ? "WebGPU" : "WASM";
-    const sliceText = supportsSlicing ? primaryProfile.sliceLabel : "single local bundle";
-    elements.statusCopy.textContent = `${modelName}. ${runtimeMode}. ${sliceText}.`;
-  } else if (runtime?.dependencies_ready && runtime?.model_ready) {
-    elements.statusCopy.textContent = "Browser bundle unavailable. Host runtime is ready.";
-  } else {
-    elements.statusCopy.textContent = "Chronicle still needs a complete local runtime path.";
-  }
-}
-
-function buildIntroMessage() {
-  const browserConfig = state.browserConfig;
-  const browserCapabilities = state.browserCapabilities;
-  const modelName = browserConfig?.display_name || "Gemma 3n adaptive";
-
-  if (browserConfig?.local_model_ready) {
-    const firstCandidate = browserCapabilities?.candidates?.[0];
-    return [
-      "Chronicle is ready.",
-      `Local model: ${modelName}`,
-      firstCandidate ? `Device target: ${firstCandidate.label}` : "",
-      "Pick a mode, choose search depth, and open the finished HTML issue when Chronicle is done.",
-    ]
-      .filter(Boolean)
-      .join("\n");
+  if (state.browserRuntimeStatus === "ready") {
+    setStatusPill("Gemma 3n ready");
+    elements.statusCopy.textContent = state.browserRuntimeMessage;
+    return;
   }
 
-  if (state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready) {
-    return "Chronicle is ready through the host runtime. Pick a mode and Chronicle will write the issue.";
+  if (state.browserRuntimeStatus === "error") {
+    setStatusPill("Model blocked", "is-danger");
+    elements.statusCopy.textContent = state.browserRuntimeMessage;
+    return;
   }
 
-  return "Chronicle is online, but the local runtime still needs a complete model path before generation can succeed.";
+  setStatusPill("Preparing Gemma 3n", "is-warm");
+  elements.statusCopy.textContent = state.browserRuntimeMessage || `Preparing Gemma 3n in ${runtimeLabel}.`;
 }
 
 function startNewTurn(userPrompt) {
   appendUserMessage(userPrompt);
   elements.brief.value = "";
   state.currentTurn = {
-    statusNode: appendAssistantMessage("Extracting web info", "Stage"),
+    statusNode: appendAssistantMessage("Generating search queries", "Stage"),
     stageNode: appendStageCard(),
     resultNode: null,
     completed: false,
   };
-  setStageState("research", "active");
-  setStageState("brain", "pending");
-  setStageState("generate", "pending");
-}
-
-function startRecoveredTurn() {
-  state.currentTurn = {
-    statusNode: appendAssistantMessage("Resuming Chronicle", "Stage"),
-    stageNode: appendStageCard(),
-    resultNode: null,
-    completed: false,
-  };
-  setStageState("research", "complete");
-  setStageState("brain", "complete");
-  setStageState("generate", "active");
+  state.activeStageKey = "query";
+  TURN_STAGES.forEach((stage, index) => {
+    setStageState(stage.key, index === 0 ? "active" : "pending");
+  });
 }
 
 function updateTurnStatus(text) {
-  const turn = ensureCurrentTurn();
+  const turn = state.currentTurn;
+  if (!turn?.statusNode) {
+    return;
+  }
   const body = turn.statusNode.querySelector(".message-body");
   body.textContent = text;
   scrollThreadToBottom();
 }
 
-function appendLogLines(lines) {
-  void lines;
+async function runBrowserPipeline(payload) {
+  const config = DEPTH_CONFIG[payload.depth] || DEPTH_CONFIG.medium;
+  const run = {
+    config: payload,
+    queryPlan: null,
+    rawResults: [],
+    resultSummaries: [],
+    selectedSummaries: [],
+    finalNewsletter: null,
+  };
+
+  state.activeStageKey = "query";
+  updateTurnStatus("Loading Chronicle brain");
+  setStageState("query", "active", getWarmupProgressLabel());
+  const aiSession = await waitForBrowserSessionReady();
+  updateTurnStatus("Generating search queries");
+  run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
+  setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
+
+  state.activeStageKey = "search";
+  setStageState("search", "active", "Connecting to Google");
+  updateTurnStatus("Fetching Google results");
+  run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
+  if (!run.rawResults.length) {
+    throw new Error("Google returned no readable results for this topic.");
+  }
+  setStageState("search", "complete", `${run.rawResults.length} results collected`);
+
+  state.activeStageKey = "summarize";
+  const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
+  setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
+  updateTurnStatus("Summarizing results");
+  for (let index = 0; index < prioritizedRawResults.length; index += 1) {
+    const result = prioritizedRawResults[index];
+    const summary = await summarizeSearchResult(aiSession, result);
+    run.resultSummaries.push(summary);
+    const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
+    setStageState("summarize", "active", progressText);
+    updateTurnStatus(`Summarizing results (${progressText})`);
+  }
+  setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
+  const modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+  if (modelSummaryCount < Math.max(2, Math.ceil(run.resultSummaries.length * 0.45))) {
+    throw new Error("Chronicle could not produce enough model-written evidence summaries. Retry after warmup finishes.");
+  }
+  run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
+
+  state.activeStageKey = "newsletter";
+  setStageState("newsletter", "active", "Writing issue");
+  updateTurnStatus("Generating newsletter");
+  run.finalNewsletter = await generateNewsletter(aiSession, run);
+  const stage4Seconds = Math.max(1, Math.round((run.writeTimings?.totalMs || 0) / 1000));
+  setStageState("newsletter", "complete", `Draft complete (${stage4Seconds}s)`);
+
+  state.activeStageKey = "render";
+  setStageState("render", "active", "Preparing HTML issue");
+  updateTurnStatus("Rendering newsletter");
+  appendResultCard(run.finalNewsletter);
+  setStageState("render", "complete", "Ready");
+  updateTurnStatus(`Issue ready: ${run.finalNewsletter.title}`);
+  setGenerateBusy(false);
 }
 
-function appendResultCard(run, markdown) {
+async function generateSearchPlan(aiSession, payload, queryCount) {
+  const promptVariants = [
+    [
+      "Make Google queries for a news research task.",
+      `Topic: ${payload.brief}`,
+      `Need exactly ${queryCount} queries.`,
+      "Return plain text only in this exact format:",
+      "TITLE: short issue title",
+      "Q1: search query",
+      "Q2: search query",
+      "Q3: search query",
+      "Q4: search query",
+      "Rules:",
+      "- short literal search queries",
+      "- focus on fresh reporting",
+      "- no markdown",
+      "- no explanation",
+    ].join("\n"),
+    [
+      `Topic: ${payload.brief}`,
+      `Return TITLE plus exactly ${queryCount} search lines.`,
+      "Format:",
+      "TITLE: ...",
+      "Q1: ...",
+      "Q2: ...",
+    ].join("\n"),
+  ];
+
+  let lastText = "";
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: 140,
+        timeoutMs: 90000,
+      });
+      lastText = generatedText;
+      const plan = parseSearchPlanText(generatedText, queryCount, payload.brief);
+      if (plan) {
+        return plan;
+      }
+    } catch (error) {
+      console.warn("[Chronicle] Query-plan generation attempt failed.", error);
+    }
+  }
+
+  const repairedPlan = parseSearchPlanText(lastText, queryCount, payload.brief);
+  if (repairedPlan) {
+    return repairedPlan;
+  }
+
+  return buildFallbackQueryPlan(payload.brief, queryCount);
+}
+
+async function fetchAllGoogleResults(queries, perQuery) {
+  const allResults = [];
+
+  for (let index = 0; index < queries.length; index += 1) {
+    const query = queries[index];
+    setStageState("search", "active", `Query ${index + 1}/${queries.length}`);
+    updateTurnStatus(`Fetching Google results (${index + 1}/${queries.length})`);
+    const results = await fetchGoogleResults(query, perQuery);
+    allResults.push(...results);
+  }
+
+  return allResults;
+}
+
+async function fetchGoogleResults(query, limit) {
+  const url = new URL("/search/google", window.location.origin);
+  url.searchParams.set("q", query);
+  url.searchParams.set("hl", "en-US");
+  url.searchParams.set("gl", "US");
+  url.searchParams.set("ceid", "US:en");
+
+  let response;
+  try {
+    response = await fetch(url.toString(), {
+      method: "GET",
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new Error("Chronicle could not reach the local Google relay.");
+  }
+
+  if (!response.ok) {
+    let relayError = "";
+    try {
+      const payload = await response.json();
+      relayError = cleanText(payload.error || "");
+    } catch (error) {
+      relayError = "";
+    }
+    throw new Error(relayError || `Google search relay failed with status ${response.status}.`);
+  }
+
+  const xmlText = await response.text();
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(xmlText, "application/xml");
+  if (xml.querySelector("parsererror")) {
+    throw new Error("Google returned unreadable search data.");
+  }
+
+  return Array.from(xml.querySelectorAll("item"))
+    .slice(0, limit)
+    .map((item, index) => {
+      const title = cleanText(item.querySelector("title")?.textContent || "");
+      const resultUrl = cleanText(item.querySelector("link")?.textContent || "");
+      const description = item.querySelector("description")?.textContent || "";
+      const snippet = extractSnippetFromDescription(description, title);
+
+      return {
+        result_id: `${slugify(query)}-${index + 1}`,
+        query,
+        rank: index + 1,
+        title,
+        url: resultUrl,
+        snippet,
+      };
+    })
+    .filter((item) => item.title && item.url);
+}
+
+async function summarizeSearchResult(aiSession, rawResult) {
+  const promptVariants = [
+    [
+      "Summarize one raw Google result without inventing facts.",
+      `title: ${rawResult.title}`,
+      `url: ${rawResult.url}`,
+      `snippet: ${rawResult.snippet || "(empty)"}`,
+      "Return plain text only in this exact format:",
+      "SUMMARY: ...",
+      "SIGNAL: ...",
+      "CONFIDENCE: ...",
+      "Rules:",
+      "- SUMMARY max 2 sentences",
+      "- rewrite the headline in fresh prose",
+      "- do not copy the full title verbatim",
+      "- SIGNAL max 12 words",
+      "- CONFIDENCE must say this is headline/snippet level evidence",
+    ].join("\n"),
+    `SUMMARY: ...\nSIGNAL: ...\nCONFIDENCE: ...\ntitle: ${rawResult.title}\nsnippet: ${rawResult.snippet || "(empty)"}`,
+  ];
+
+  let lastText = "";
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: 160,
+        timeoutMs: 90000,
+      });
+      lastText = generatedText;
+      const summary = parseResultSummaryText(generatedText, rawResult);
+      if (summary) {
+        summary.model_generated = true;
+        return summary;
+      }
+    } catch (error) {
+      console.warn(`[Chronicle] Result summarization failed for ${rawResult.title}.`, error);
+    }
+  }
+
+  const repaired = parseResultSummaryText(lastText, rawResult);
+  if (repaired) {
+    repaired.model_generated = true;
+    return repaired;
+  }
+  return buildFallbackResultSummary(rawResult);
+}
+
+async function generateNewsletter(aiSession, run) {
+  run.writeTimings = {};
+  run.writeDeadlineAt = Date.now() + WRITER_POLICY.stage4DeadlineMs;
+  const newsletterStartedAt = performance.now();
+  updateTurnStatus("Generating newsletter (framing)");
+  setStageState("newsletter", "active", "Framing");
+  const frameStartedAt = performance.now();
+  const frame = await generateNewsletterFrame(aiSession, run);
+  ensureWriterDeadline(run, "framing");
+  run.writeTimings.frameMs = Math.round(performance.now() - frameStartedAt);
+
+  updateTurnStatus("Generating newsletter (writing sections)");
+  setStageState("newsletter", "active", "Writing sections");
+  const bodyStartedAt = performance.now();
+  let generatedMarkdown = await generateNewsletterBody(aiSession, run, frame);
+  ensureWriterDeadline(run, "drafting");
+  run.writeTimings.bodyMs = Math.round(performance.now() - bodyStartedAt);
+  if (!generatedMarkdown) {
+    updateTurnStatus("Generating newsletter (fallback pass)");
+    setStageState("newsletter", "active", "Fallback pass");
+    const fallbackStartedAt = performance.now();
+    generatedMarkdown = await generateWholeNewsletterFallback(aiSession, run, frame);
+    ensureWriterDeadline(run, "fallback");
+    run.writeTimings.fallbackMs = Math.round(performance.now() - fallbackStartedAt);
+  }
+  if (generatedMarkdown && shouldRunPolishPass(generatedMarkdown)) {
+    updateTurnStatus("Generating newsletter (final edit pass)");
+    setStageState("newsletter", "active", "Final edit pass");
+    const polishStartedAt = performance.now();
+    const polished = await polishNewsletterDraft(aiSession, run, frame, generatedMarkdown);
+    ensureWriterDeadline(run, "final edit");
+    run.writeTimings.polishMs = Math.round(performance.now() - polishStartedAt);
+    if (polished) {
+      generatedMarkdown = polished;
+    }
+  }
+  if (!generatedMarkdown) {
+    throw new Error("Chronicle's writer could not complete a full newsletter for this topic.");
+  }
+  run.writeTimings.totalMs = Math.round(performance.now() - newsletterStartedAt);
+
+  const markdown = finalizeNewsletterMarkdown(generatedMarkdown, run);
+  const title = extractTitleFromMarkdown(markdown, run.queryPlan.title);
+  const storageKey = `chronicle::issue::${slugify(title)}::${Date.now()}`;
+  const htmlDocument = renderEditableIssueHtml(title, markdown, storageKey);
+
+  return {
+    title,
+    markdown,
+    htmlDocument,
+    storageKey,
+    downloadName: `${slugify(title)}-editable.html`,
+  };
+}
+
+function buildNewsletterPromptVariants(run, frame) {
+  const styleInstructions = buildPresentationInstructions(run.config);
+  const variants = [];
+  const evidence = (run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries).slice(0, 6);
+
+  for (const summaryChars of WRITER_POLICY.fallbackVariantChars) {
+    const summaryLines = evidence
+      .map((summary, index) => (
+        `[${index + 1}] ${trimText(summary.source_title, summaryChars >= 140 ? 96 : 72)}\n` +
+        `summary: ${trimText(summary.summary, summaryChars)}\n` +
+        `signal: ${trimText(summary.signal, summaryChars >= 140 ? 64 : 48)}\n` +
+        `confidence: ${trimText(summary.confidence_note, 92)}`
+      ))
+      .join("\n\n");
+
+    variants.push({
+      promptText: [
+        "You are Chronicle.",
+        "Use only the summarized evidence below to write one original markdown newsletter.",
+        "Do not dump headlines. Synthesize them into one coherent argument.",
+        `Topic: ${run.config.brief}`,
+        `Title: ${frame.title}`,
+        `Subtitle: ${frame.subtitle}`,
+        `Mode: ${run.config.explanation_style}`,
+        `Style instructions: ${styleInstructions}`,
+        `Editorial angle: ${frame.angle}`,
+        `Section headings: ${frame.headings.join(" | ")}`,
+        "",
+        "Summarized evidence:",
+        summaryLines,
+        "",
+        "Write one markdown newsletter with these rules:",
+        "- start with one H1 title using the provided title",
+        "- immediately add one italic subtitle line using the provided subtitle",
+        "- write one opening paragraph that states the main thesis",
+        "- use the provided section headings as H2s",
+        "- each section must advance the argument, not repeat source titles",
+        "- do not paste or mirror headline text line-by-line",
+        "- cite sources inline as [1], [2], [3] when making claims",
+        "- end with ## Sources",
+        "- do not use raw URLs outside the Sources section",
+        "- write only markdown",
+      ].join("\n"),
+      maxNewTokens: summaryChars >= 110 ? aiTokenBudget(run, WRITER_POLICY.fallbackMaxTokens.medium) : aiTokenBudget(run, WRITER_POLICY.fallbackMaxTokens.compact),
+      timeoutMs: aiTimeoutBudget(run, WRITER_POLICY.fallbackTimeoutMs),
+    });
+  }
+
+  return variants;
+}
+
+function buildPresentationInstructions(config) {
+  if (config.explanation_style === "custom" && config.style_instructions) {
+    return trimText(config.style_instructions, 220);
+  }
+  return MODE_COPY[config.explanation_style] || MODE_COPY.concise;
+}
+
+async function generateNewsletterFrame(aiSession, run) {
+  const evidence = (run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries).slice(0, 6);
+  const summaryLines = evidence
+    .map((summary, index) => (
+      `[${index + 1}] ${trimText(summary.source_title, 88)}\n` +
+      `summary: ${trimText(summary.summary, 132)}\n` +
+      `signal: ${trimText(summary.signal, 56)}`
+    ))
+    .join("\n\n");
+
+  const promptVariants = [
+    [
+      "Create the editorial frame for a Chronicle newsletter.",
+      `Topic: ${run.config.brief}`,
+      `Mode: ${run.config.explanation_style}`,
+      `Style instructions: ${buildPresentationInstructions(run.config)}`,
+      "",
+      "Evidence:",
+      summaryLines,
+      "",
+      "Return plain text only in this exact format:",
+      "TITLE: ...",
+      "SUBTITLE: ...",
+      "ANGLE: ...",
+      "H1: ...",
+      "H2: ...",
+      "H3: ...",
+      "Rules:",
+      "- title must be original and specific",
+      "- subtitle must state the core thesis in one sentence",
+      "- angle must describe the main argument",
+      "- headings must be dynamic and topic-specific",
+      "- do not use generic headings like What happened or Why it matters",
+    ].join("\n"),
+    [
+      `Topic: ${run.config.brief}`,
+      "Return TITLE, SUBTITLE, ANGLE, H1, H2, H3.",
+      "No markdown.",
+      summaryLines,
+    ].join("\n"),
+  ];
+
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: 220,
+        timeoutMs: 150000,
+      });
+      const frame = parseNewsletterFrameText(generatedText, run);
+      if (frame) {
+        return frame;
+      }
+    } catch (error) {
+      console.warn("[Chronicle] Newsletter frame generation failed.", error);
+    }
+  }
+
+  return buildFallbackNewsletterFrame(run);
+}
+
+async function generateNewsletterBody(aiSession, run, frame) {
+  const opening = await generateNewsletterOpening(aiSession, run, frame);
+  if (!opening) {
+    return "";
+  }
+
+  const sections = [];
+  for (const heading of frame.headings.slice(0, 3)) {
+    const section = await generateNewsletterSection(aiSession, run, frame, heading, sections);
+    if (!section) {
+      return "";
+    }
+    sections.push(section);
+  }
+
+  return [
+    `# ${frame.title}`,
+    "",
+    `_${frame.subtitle}_`,
+    "",
+    opening,
+    "",
+    ...sections,
+  ].join("\n");
+}
+
+async function generateNewsletterOpening(aiSession, run, frame) {
+  const evidence = selectEvidenceForHeading(run, frame.angle, WRITER_POLICY.openingEvidenceCount);
+  const promptVariants = [
+    buildOpeningPrompt(run, frame, evidence, false),
+    buildOpeningPrompt(run, frame, evidence, true),
+  ];
+
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: aiTokenBudget(run, WRITER_POLICY.openingMaxTokens),
+        timeoutMs: writerTimeoutBudget(run, WRITER_POLICY.openingAttemptTimeoutMs),
+        doSample: true,
+        temperature: 0.72,
+        topP: 0.92,
+      });
+      const paragraph = cleanGeneratedProse(generatedText);
+      if (isUsableParagraph(paragraph)) {
+        return paragraph;
+      }
+    } catch (error) {
+      console.warn("[Chronicle] Opening generation failed.", error);
+    }
+  }
+
+  return "";
+}
+
+async function generateNewsletterSection(aiSession, run, frame, heading, previousSections) {
+  const evidence = selectEvidenceForHeading(run, heading, WRITER_POLICY.sectionEvidenceCount);
+  const promptVariants = [
+    buildSectionPrompt(run, frame, heading, evidence, previousSections, false),
+    buildSectionPrompt(run, frame, heading, evidence, previousSections, true),
+  ];
+
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: aiTokenBudget(run, WRITER_POLICY.sectionMaxTokens),
+        timeoutMs: writerTimeoutBudget(run, WRITER_POLICY.sectionAttemptTimeoutMs),
+        doSample: true,
+        temperature: 0.74,
+        topP: 0.93,
+      });
+      const sectionMarkdown = normalizeSectionMarkdown(generatedText, heading);
+      if (isUsableSectionMarkdown(sectionMarkdown, heading)) {
+        return sectionMarkdown;
+      }
+    } catch (error) {
+      console.warn(`[Chronicle] Section generation failed for ${heading}.`, error);
+    }
+  }
+
+  return "";
+}
+
+async function generateWholeNewsletterFallback(aiSession, run, frame) {
+  const promptVariants = buildNewsletterPromptVariants(run, frame);
+
+  for (const variant of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, variant.promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: variant.maxNewTokens,
+        timeoutMs: variant.timeoutMs,
+        doSample: true,
+        temperature: 0.74,
+        topP: 0.93,
+      });
+
+      const cleaned = stripMarkdownFences(generatedText).trim();
+      if (isUsableNewsletterMarkdown(cleaned, frame)) {
+        return cleaned;
+      }
+    } catch (error) {
+      console.warn("[Chronicle] Whole-issue fallback generation failed.", error);
+    }
+  }
+
+  return "";
+}
+
+function buildEmergencyNewsletterMarkdown(run, frame) {
+  const evidence = (run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries)
+    .slice(0, 6)
+    .map((summary) => ({
+      ...summary,
+      sourceIndex: run.resultSummaries.findIndex((item) => item.result_id === summary.result_id) + 1,
+    }));
+
+  const sections = frame.headings.slice(0, 3).map((heading) => {
+    const items = selectEvidenceForHeading(run, heading, 2);
+    const paragraph = buildEmergencySectionParagraph(items, frame.angle, heading);
+    return `## ${heading}\n\n${paragraph}`;
+  });
+
+  return [
+    `# ${frame.title}`,
+    "",
+    `_${frame.subtitle}_`,
+    "",
+    buildEmergencyLeadParagraph(evidence, frame.angle),
+    "",
+    ...sections,
+  ].join("\n");
+}
+
+function buildEmergencyLeadParagraph(evidence, angle) {
+  const primary = evidence[0];
+  const secondary = evidence[1];
+  const first = primary ? distillSummary(primary.summary, primary.source_title) : "Chronicle assembled a browser-side evidence packet for this issue.";
+  const second = secondary ? distillSummary(secondary.summary, secondary.source_title) : "";
+  return [
+    trimSentence(`${first} [${primary?.sourceIndex || 1}]`),
+    second ? trimSentence(`Taken together, the reporting suggests ${angle.toLowerCase()}. ${second} [${secondary.sourceIndex}]`) : trimSentence(`Taken together, the reporting suggests ${angle.toLowerCase()}.`),
+  ].filter(Boolean).join(" ");
+}
+
+function buildEmergencySectionParagraph(items, angle, heading) {
+  if (!items.length) {
+    return `The strongest available evidence around ${heading.toLowerCase()} remains thin, but the reporting still points back to ${angle.toLowerCase()}.`;
+  }
+
+  const first = items[0];
+  const second = items[1];
+  const firstSentence = trimSentence(`${distillSummary(first.summary, first.source_title)} [${first.sourceIndex}]`);
+  const secondSentence = second
+    ? trimSentence(`${distillSummary(second.summary, second.source_title)} [${second.sourceIndex}]`)
+    : "";
+  const connective = trimSentence(`The through-line is ${angle.toLowerCase()}, which is why this section matters beyond any single headline.`);
+
+  return [firstSentence, secondSentence, connective].filter(Boolean).join(" ");
+}
+
+async function generateStructuredJson(aiSession, promptVariants, options) {
+  let lastError = null;
+
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: options.maxNewTokens,
+        timeoutMs: options.timeoutMs,
+      });
+      const parsed = parseJsonBlock(generatedText);
+      const validated = options.validate(parsed);
+      if (validated) {
+        return parsed;
+      }
+      lastError = new Error("Generated JSON did not pass validation.");
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(options.errorMessage || lastError?.message || "Chronicle could not generate valid structured output.");
+}
+
+function normalizeQueryPlan(value, queryCount) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const title = cleanText(value.title || "");
+  const queries = uniqueStrings(value.queries || []).slice(0, queryCount);
+  if (!title || queries.length !== queryCount) {
+    return null;
+  }
+
+  return {
+    title,
+    queries,
+  };
+}
+
+function parseSearchPlanText(text, queryCount, brief) {
+  const lines = String(stripMarkdownFences(text) || "")
+    .split(/\r?\n/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return null;
+  }
+
+  let title = "";
+  const queries = [];
+
+  lines.forEach((line) => {
+    const titleMatch = line.match(/^title\s*:\s*(.+)$/i);
+    if (titleMatch && !title) {
+      title = cleanText(titleMatch[1]);
+      return;
+    }
+
+    const queryMatch = line.match(/^q\d+\s*:\s*(.+)$/i);
+    if (queryMatch) {
+      queries.push(cleanText(queryMatch[1]));
+      return;
+    }
+
+    if (!title) {
+      title = line.replace(/^[-*•]\s*/, "");
+      return;
+    }
+
+    if (/^[\-\*\u2022]/.test(line) || /\bnews\b|\bweek\b|\blatest\b|\bupdate\b/i.test(line)) {
+      queries.push(line.replace(/^[-*•]\s*/, "").replace(/^q\d+\s*:\s*/i, ""));
+    }
+  });
+
+  const finalTitle = cleanTitle(title || brief);
+  const finalQueries = uniqueStrings(queries.map((query) => cleanSearchQuery(query)));
+  if (!finalTitle) {
+    return null;
+  }
+
+  const filledQueries = fillMissingQueries(finalQueries, brief, queryCount);
+  if (filledQueries.length !== queryCount) {
+    return null;
+  }
+
+  return {
+    title: finalTitle,
+    queries: filledQueries,
+  };
+}
+
+function buildFallbackQueryPlan(brief, queryCount) {
+  return {
+    title: cleanTitle(brief),
+    queries: fillMissingQueries([], brief, queryCount),
+  };
+}
+
+function parseNewsletterFrameText(text, run) {
+  const lines = String(stripMarkdownFences(text) || "")
+    .split(/\r?\n/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return null;
+  }
+
+  let title = "";
+  let subtitle = "";
+  let angle = "";
+  const headings = [];
+
+  lines.forEach((line) => {
+    const titleMatch = line.match(/^title\s*:\s*(.+)$/i);
+    if (titleMatch && !title) {
+      title = cleanText(titleMatch[1]);
+      return;
+    }
+
+    const subtitleMatch = line.match(/^subtitle\s*:\s*(.+)$/i);
+    if (subtitleMatch && !subtitle) {
+      subtitle = cleanText(subtitleMatch[1]);
+      return;
+    }
+
+    const angleMatch = line.match(/^angle\s*:\s*(.+)$/i);
+    if (angleMatch && !angle) {
+      angle = cleanText(angleMatch[1]);
+      return;
+    }
+
+    const headingMatch = line.match(/^h\d+\s*:\s*(.+)$/i);
+    if (headingMatch) {
+      headings.push(cleanText(headingMatch[1]));
+    }
+  });
+
+  title = cleanTitle(title || run.queryPlan?.title || run.config.brief);
+  subtitle = cleanText(subtitle);
+  angle = cleanText(angle || subtitle);
+  const finalHeadings = uniqueStrings(headings.map(cleanText))
+    .filter((heading) => !looksGenericHeading(heading))
+    .slice(0, 4);
+
+  if (!subtitle || !angle || finalHeadings.length < 2) {
+    return null;
+  }
+
+  return {
+    title,
+    subtitle: trimText(subtitle, 180),
+    angle: trimText(angle, 160),
+    headings: finalHeadings,
+  };
+}
+
+function buildFallbackNewsletterFrame(run) {
+  const focus = cleanTitle(run.queryPlan?.title || run.config.brief);
+  const topicPhrase = trimText(cleanText(run.config.brief), 80);
+  return {
+    title: focus,
+    subtitle: `This issue examines how the latest reporting is reshaping the outlook on ${topicPhrase}.`,
+    angle: `Build one coherent argument about the current direction of ${topicPhrase}.`,
+    headings: [
+      `${focus}: current direction`,
+      `Where the evidence converges`,
+      `What changes next`,
+    ],
+  };
+}
+
+function looksGenericHeading(heading) {
+  const text = cleanText(heading).toLowerCase();
+  return [
+    "what happened",
+    "why it matters",
+    "key developments",
+    "what surfaced first",
+    "what the evidence points to",
+    "what to watch next",
+  ].includes(text);
+}
+
+function normalizeResultSummary(value, rawResult) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const summary = trimText(cleanText(value.summary || ""), 260);
+  const signal = trimText(cleanText(value.signal || ""), 90);
+  const confidenceNote = trimText(cleanText(value.confidence_note || value.confidenceNote || ""), 140);
+  if (!summary || !signal || !confidenceNote) {
+    return null;
+  }
+  if (looksTemplateLanguage(summary) || looksTemplateLanguage(signal)) {
+    return null;
+  }
+
+  if (looksTooCloseToHeadline(summary, rawResult.title) || looksTooCloseToHeadline(signal, rawResult.title)) {
+    return null;
+  }
+
+  return {
+    result_id: cleanText(value.result_id || rawResult.result_id),
+    source_title: cleanText(value.source_title || rawResult.title),
+    source_url: cleanText(value.source_url || rawResult.url),
+    summary,
+    signal,
+    confidence_note: confidenceNote,
+    model_generated: true,
+    query: rawResult.query,
+    rank: rawResult.rank,
+  };
+}
+
+function parseResultSummaryText(text, rawResult) {
+  const lines = String(stripMarkdownFences(text) || "")
+    .split(/\r?\n/)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+
+  if (!lines.length) {
+    return null;
+  }
+
+  let summary = "";
+  let signal = "";
+  let confidenceNote = "";
+
+  lines.forEach((line) => {
+    const summaryMatch = line.match(/^summary\s*:\s*(.+)$/i);
+    if (summaryMatch && !summary) {
+      summary = cleanText(summaryMatch[1]);
+      return;
+    }
+
+    const signalMatch = line.match(/^signal\s*:\s*(.+)$/i);
+    if (signalMatch && !signal) {
+      signal = cleanText(signalMatch[1]);
+      return;
+    }
+
+    const confidenceMatch = line.match(/^confidence\s*:\s*(.+)$/i);
+    if (confidenceMatch && !confidenceNote) {
+      confidenceNote = cleanText(confidenceMatch[1]);
+    }
+  });
+
+  if (!summary && lines[0]) {
+    summary = lines[0];
+  }
+  if (!signal && lines[1]) {
+    signal = lines[1];
+  }
+  if (!confidenceNote) {
+    confidenceNote = "This is headline and snippet level evidence, so details may shift.";
+  }
+
+  return normalizeResultSummary(
+    {
+      result_id: rawResult.result_id,
+      source_title: rawResult.title,
+      source_url: rawResult.url,
+      summary,
+      signal,
+      confidence_note: confidenceNote,
+    },
+    rawResult,
+  );
+}
+
+function buildFallbackResultSummary(rawResult) {
+  const snippet = cleanText(rawResult.snippet || "");
+  const summary = snippet && !looksTooCloseToHeadline(snippet, rawResult.title)
+    ? trimText(snippet, 180)
+    : trimText(`Reporting mentions a potentially relevant development tied to ${rawResult.query}.`, 180);
+  const signal = summarizeHeadlineSignal(rawResult.title, rawResult.query);
+  return {
+    result_id: rawResult.result_id,
+    source_title: rawResult.title,
+    source_url: rawResult.url,
+    summary,
+    signal,
+    confidence_note: "This is headline and snippet level evidence, so details may shift.",
+    model_generated: false,
+    query: rawResult.query,
+    rank: rawResult.rank,
+  };
+}
+
+function isUsableNewsletterMarkdown(markdown, frame) {
+  const text = String(markdown || "").trim();
+  if (text.length < 220) {
+    return false;
+  }
+  if (!/^#\s+/m.test(text)) {
+    return false;
+  }
+  const headingCount = (text.match(/^##\s+/gm) || []).length;
+  if (headingCount < 2) {
+    return false;
+  }
+  if (looksLikeSourceDump(text)) {
+    return false;
+  }
+  if (looksTemplateLanguage(text)) {
+    return false;
+  }
+  if (frame?.headings?.length) {
+    const hasAnyPlannedHeading = frame.headings.some((heading) => text.toLowerCase().includes(heading.toLowerCase()));
+    if (!hasAnyPlannedHeading) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function shouldRunPolishPass(markdown) {
+  if (!WRITER_POLICY.polishOnPassOnly) {
+    return true;
+  }
+  return looksLikeSourceDump(markdown) || looksTemplateLanguage(markdown) || looksRepetitiveNewsletter(markdown);
+}
+
+function looksLikeSourceDump(text) {
+  const lines = String(text || "").split(/\r?\n/).map((line) => cleanText(line)).filter(Boolean);
+  const repeatedSourceLines = lines.filter((line) => / - (Reuters|CNBC|Fortune|Economic Times|Bloomberg|AP|BBC|The New York Times|CNN|TechCrunch)\b/i.test(line));
+  const titleEchoCount = lines.filter((line) => /\.\s+[A-Z][A-Za-z0-9'’"“”\-]/.test(line) && line.length > 90).length;
+  return repeatedSourceLines.length >= 3 || titleEchoCount >= 4;
+}
+
+function looksTemplateLanguage(text) {
+  const value = cleanText(text).toLowerCase();
+  return [
+    "this source points to a development related to",
+    "the strongest signal in this reporting window",
+    "the central shift",
+    "how the evidence connects",
+    "what to watch next",
+    "taken together, the reporting suggests synthesize",
+  ].some((pattern) => value.includes(pattern));
+}
+
+function looksRepetitiveNewsletter(text) {
+  const paragraphs = String(text || "")
+    .split(/\n{2,}/)
+    .map((part) => cleanText(part).toLowerCase())
+    .filter((part) => part && !part.startsWith("#"));
+  if (paragraphs.length < 3) {
+    return false;
+  }
+  let nearDuplicatePairs = 0;
+  for (let leftIndex = 0; leftIndex < paragraphs.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < paragraphs.length; rightIndex += 1) {
+      if (paragraphSimilarity(paragraphs[leftIndex], paragraphs[rightIndex]) >= 0.86) {
+        nearDuplicatePairs += 1;
+      }
+    }
+  }
+  return nearDuplicatePairs >= 2;
+}
+
+function paragraphSimilarity(leftText, rightText) {
+  const left = buildKeywordSet(leftText);
+  const right = buildKeywordSet(rightText);
+  if (!left.size || !right.size) {
+    return 0;
+  }
+  const overlap = countTokenOverlap(left, right);
+  const union = new Set([...left, ...right]).size;
+  return union ? overlap / union : 0;
+}
+
+function selectNarrativeSources(resultSummaries, brief) {
+  const topicTokens = buildKeywordSet(brief);
+  const hasTopicTokens = topicTokens.size > 0;
+  const scored = resultSummaries.map((summary, index) => {
+    const text = `${summary.source_title} ${summary.summary} ${summary.signal}`;
+    const tokens = buildKeywordSet(text);
+    const overlapWithTopic = countTokenOverlap(tokens, topicTokens);
+    const pairwiseDensity = resultSummaries.reduce((score, other, otherIndex) => {
+      if (index === otherIndex) {
+        return score;
+      }
+      return score + Math.min(countTokenOverlap(tokens, buildKeywordSet(`${other.source_title} ${other.summary} ${other.signal}`)), 4);
+    }, 0);
+    const outlet = extractOutletName(summary.source_title);
+    const quality = computeOutletScore(outlet, summary.source_title);
+    return {
+      ...summary,
+      topicOverlap: overlapWithTopic,
+      narrativeScore: overlapWithTopic * 4 + pairwiseDensity + quality,
+    };
+  });
+
+  const filtered = hasTopicTokens
+    ? scored.filter((summary) => summary.topicOverlap > 0)
+    : scored;
+
+  return (filtered.length ? filtered : scored)
+    .sort((left, right) => right.narrativeScore - left.narrativeScore)
+    .slice(0, 6);
+}
+
+function prioritizeResultsForSummarization(rawResults, brief, summarizeCount) {
+  const topicTokens = buildKeywordSet(brief);
+  const seenByOutlet = new Set();
+  const ranked = rawResults
+    .map((result) => {
+      const textTokens = buildKeywordSet(`${result.title} ${result.snippet} ${result.query}`);
+      const overlap = countTokenOverlap(textTokens, topicTokens);
+      const outlet = extractOutletName(result.title);
+      const outletQuality = computeOutletScore(outlet, result.title);
+      const rankBonus = Math.max(0, 6 - Number(result.rank || 6));
+      const score = overlap * 5 + outletQuality + rankBonus;
+      return { ...result, _rankScore: score };
+    })
+    .sort((left, right) => right._rankScore - left._rankScore);
+
+  const selected = [];
+  ranked.forEach((result) => {
+    if (selected.length >= summarizeCount) {
+      return;
+    }
+    const outlet = extractOutletName(result.title).toLowerCase();
+    if (outlet && seenByOutlet.has(outlet) && selected.length + 1 < summarizeCount) {
+      return;
+    }
+    if (outlet) {
+      seenByOutlet.add(outlet);
+    }
+    selected.push(result);
+  });
+
+  if (selected.length < summarizeCount) {
+    ranked.forEach((result) => {
+      if (selected.length >= summarizeCount) {
+        return;
+      }
+      if (!selected.some((item) => item.result_id === result.result_id)) {
+        selected.push(result);
+      }
+    });
+  }
+
+  return selected.slice(0, summarizeCount);
+}
+
+function buildKeywordSet(text) {
+  const stopwords = new Set([
+    "the", "and", "for", "with", "from", "that", "this", "have", "will", "into", "about", "after",
+    "latest", "update", "news", "week", "more", "says", "report", "amid", "over", "under", "their",
+    "they", "them", "than", "what", "when", "where", "which", "while", "into", "across",
+  ]);
+
+  return new Set(
+    cleanText(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length > 2 && !stopwords.has(token)),
+  );
+}
+
+function countTokenOverlap(left, right) {
+  let count = 0;
+  left.forEach((token) => {
+    if (right.has(token)) {
+      count += 1;
+    }
+  });
+  return count;
+}
+
+function extractOutletName(sourceTitle) {
+  const parts = String(sourceTitle || "").split(" - ");
+  return cleanText(parts[parts.length - 1] || "");
+}
+
+function computeOutletScore(outlet, title) {
+  const premium = ["Reuters", "BBC", "Bloomberg", "Financial Times", "The New York Times", "Wall Street Journal", "AP", "CNBC", "Fortune"];
+  const weak = ["LinkedIn", "MarTech", "Economic Times", "Investor's Business Daily"];
+  if (premium.includes(outlet)) {
+    return 8;
+  }
+  if (weak.includes(outlet) || /\bnews updates\b|\blatest ai-powered\b/i.test(title)) {
+    return -4;
+  }
+  return 1;
+}
+
+function selectEvidenceForHeading(run, heading, count) {
+  const focusTokens = buildKeywordSet(`${heading} ${run.config.brief} ${run.queryPlan?.title || ""}`);
+  const evidence = (run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries)
+    .map((summary) => ({
+      ...summary,
+      focusScore: countTokenOverlap(buildKeywordSet(`${summary.source_title} ${summary.summary} ${summary.signal}`), focusTokens) + (summary.narrativeScore || 0),
+    }))
+    .sort((left, right) => right.focusScore - left.focusScore)
+    .slice(0, count);
+
+  return evidence.map((summary) => ({
+    ...summary,
+    sourceIndex: run.resultSummaries.findIndex((item) => item.result_id === summary.result_id) + 1,
+  }));
+}
+
+function buildOpeningPrompt(run, frame, evidence, compact) {
+  const lines = evidence
+    .map((summary) => (
+      `[${summary.sourceIndex}] ${trimText(summary.source_title, compact ? 72 : 92)}\n` +
+      `summary: ${trimText(summary.summary, compact ? 96 : 132)}\n` +
+      `signal: ${trimText(summary.signal, 56)}`
+    ))
+    .join("\n\n");
+
+  return [
+    "Write the opening paragraph for a Chronicle newsletter.",
+    `Topic: ${run.config.brief}`,
+    `Mode: ${run.config.explanation_style}`,
+    `Title: ${frame.title}`,
+    `Subtitle: ${frame.subtitle}`,
+    `Angle: ${frame.angle}`,
+    `Style instructions: ${buildPresentationInstructions(run.config)}`,
+    "",
+    "Evidence:",
+    lines,
+    "",
+    "Rules:",
+    "- write 1 paragraph only",
+    "- make a real argument, not a summary list",
+    "- do not repeat source titles verbatim",
+    "- use inline citations like [1] when needed",
+    "- write only the paragraph",
+  ].join("\n");
+}
+
+function buildSectionPrompt(run, frame, heading, evidence, previousSections, compact) {
+  const lines = evidence
+    .map((summary) => (
+      `[${summary.sourceIndex}] ${trimText(summary.source_title, compact ? 72 : 92)}\n` +
+      `summary: ${trimText(summary.summary, compact ? 96 : 132)}\n` +
+      `signal: ${trimText(summary.signal, 56)}`
+    ))
+    .join("\n\n");
+  const previousContext = previousSections
+    .map((section) => cleanGeneratedProse(section).slice(0, 180))
+    .join("\n");
+  const alreadyCovered = extractPriorClaims(previousSections);
+
+  return [
+    "Write one section of a Chronicle newsletter.",
+    `Topic: ${run.config.brief}`,
+    `Mode: ${run.config.explanation_style}`,
+    `Title: ${frame.title}`,
+    `Subtitle: ${frame.subtitle}`,
+    `Angle: ${frame.angle}`,
+    `Section heading: ${heading}`,
+    `Style instructions: ${buildPresentationInstructions(run.config)}`,
+    previousContext ? `Earlier sections:\n${previousContext}` : "",
+    alreadyCovered.length ? `Already covered claims:\n${alreadyCovered.map((line, index) => `${index + 1}. ${line}`).join("\n")}` : "",
+    "",
+    "Evidence:",
+    lines,
+    "",
+    "Rules:",
+    "- start with '## {heading}' using the provided heading",
+    "- then write 2 or 3 short paragraphs",
+    "- advance the argument under this heading",
+    "- add at least one new insight that is not already covered",
+    "- do not paste or mirror headlines",
+    "- do not reuse the same sentence pattern from earlier sections",
+    "- do not write a bullet list",
+    "- use inline citations like [1] when making claims",
+    "- write only markdown for this section",
+  ].filter(Boolean).join("\n");
+}
+
+function extractPriorClaims(previousSections) {
+  const claims = [];
+  previousSections.forEach((section) => {
+    const lines = cleanGeneratedProse(section)
+      .split(/(?<=[.!?])\s+/)
+      .map((line) => trimText(cleanText(line), 120))
+      .filter((line) => line.length > 40);
+    lines.slice(0, 2).forEach((line) => claims.push(line));
+  });
+  return uniqueStrings(claims).slice(0, 4);
+}
+
+function cleanGeneratedProse(text) {
+  return cleanText(
+    stripMarkdownFences(text)
+      .replace(/^#+\s+/gm, "")
+      .replace(/^[_*]+|[_*]+$/g, "")
+  );
+}
+
+function isUsableParagraph(text) {
+  const value = String(text || "").trim();
+  if (value.length < 120) {
+    return false;
+  }
+  if (looksLikeSourceDump(value)) {
+    return false;
+  }
+  return true;
+}
+
+function normalizeSectionMarkdown(text, heading) {
+  let cleaned = stripMarkdownFences(text).trim();
+  cleaned = cleaned.replace(/^##\s+.+$/m, "").trim();
+  return `## ${heading}\n\n${cleaned}`.trim();
+}
+
+function isUsableSectionMarkdown(markdown, heading) {
+  const value = String(markdown || "").trim();
+  if (!value.startsWith(`## ${heading}`)) {
+    return false;
+  }
+  if (value.length < 180) {
+    return false;
+  }
+  if (looksLikeSourceDump(value)) {
+    return false;
+  }
+  if (looksRepetitiveNewsletter(value)) {
+    return false;
+  }
+  return true;
+}
+
+async function polishNewsletterDraft(aiSession, run, frame, markdownDraft) {
+  const promptVariants = [
+    buildPolishPrompt(run, frame, markdownDraft, false),
+    buildPolishPrompt(run, frame, markdownDraft, true),
+  ];
+
+  for (const promptText of promptVariants) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+        continue;
+      }
+      const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: aiTokenBudget(run, WRITER_POLICY.polishMaxTokens),
+        timeoutMs: aiTimeoutBudget(run, WRITER_POLICY.polishTimeoutMs),
+        doSample: true,
+        temperature: 0.68,
+        topP: 0.9,
+      });
+      const cleaned = stripMarkdownFences(generatedText).trim();
+      if (isUsableNewsletterMarkdown(cleaned, frame) && !looksRepetitiveNewsletter(cleaned)) {
+        return cleaned;
+      }
+    } catch (error) {
+      console.warn("[Chronicle] Newsletter polish pass failed.", error);
+    }
+  }
+  return "";
+}
+
+function buildPolishPrompt(run, frame, markdownDraft, compact) {
+  const draft = trimText(stripSourcesSection(markdownDraft), compact ? 2200 : 3600);
+  return [
+    "You are Chronicle's final editor.",
+    "Rewrite the draft into a publication-quality newsletter with strong flow and minimal repetition.",
+    `Topic: ${run.config.brief}`,
+    `Mode: ${run.config.explanation_style}`,
+    `Style instructions: ${buildPresentationInstructions(run.config)}`,
+    `Title must stay: ${frame.title}`,
+    "",
+    "Draft:",
+    draft,
+    "",
+    "Rules:",
+    "- keep factual claims grounded in the cited evidence",
+    "- preserve inline citations like [1], [2]",
+    "- avoid repeating the same statistic in multiple sections unless necessary",
+    "- remove template-like phrasing and headline echoes",
+    "- keep one H1 and three H2 sections",
+    "- write only markdown and do not include a Sources section",
+  ].join("\n");
+}
+
+async function ensureBrowserSession() {
+  if (state.browserSession?.model) {
+    return state.browserSession;
+  }
+
+  if (state.browserSessionPromise) {
+    return state.browserSessionPromise;
+  }
+
+  state.browserSessionPromise = loadBrowserSession()
+    .then((session) => {
+      state.browserSession = session;
+      state.browserRuntimeStatus = "ready";
+      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} Gemma 3n · ${session.profile.label} · ${runtimeLabelForSession(session)}`;
+      state.browserRuntimeProgress = 1;
+      state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
+      renderHeaderStatus();
+      return session;
+    })
+    .catch((error) => {
+      state.browserRuntimeStatus = "error";
+      state.browserRuntimeMessage = error.message || "Chronicle could not initialize the browser model.";
+      state.browserRuntimeProgressText = "Model warmup failed.";
+      renderHeaderStatus();
+      throw error;
+    })
+    .finally(() => {
+      state.browserSessionPromise = null;
+    });
+
+  return state.browserSessionPromise;
+}
+
+async function loadBrowserSession() {
+  const runtime = await loadTransformersRuntime();
+  const candidates = buildBrowserCandidates();
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    try {
+      beginBrowserLoad(candidate);
+      const progressCallback = createBrowserLoadProgressHandler(candidate);
+      try {
+        return await loadTextOnlyBrowserSession(runtime, candidate, progressCallback);
+      } catch (textOnlyError) {
+        console.warn(`[Chronicle] Text-only load failed for ${candidate.label}. Falling back to multimodal.`, textOnlyError);
+      }
+      return await loadMultimodalBrowserSession(runtime, candidate, progressCallback);
+    } catch (error) {
+      lastError = error;
+      state.browserRuntimeMessage = `Retrying with a lighter browser profile after ${candidate.label} failed.`;
+      state.browserRuntimeProgressText = "Switching runtime profile…";
+      state.browserRuntimeProgress = 0.08;
+      renderHeaderStatus();
+      console.warn(`[Chronicle] Failed browser candidate ${candidate.label}`, error);
+    }
+  }
+
+  throw new Error(lastError?.message || "No local Gemma 3n browser bundle could be initialized.");
+}
+
+async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) {
+  state.browserRuntimeMessage = `Local Gemma 3n text runtime · ${candidate.label}`;
+  state.browserRuntimeProgressText = "Opening text tokenizer…";
+  renderHeaderStatus();
+  const tokenizer = await runtime.AutoTokenizer.from_pretrained(candidate.model, {
+    progress_callback: progressCallback,
+  });
+  if (typeof tokenizer.apply_chat_template !== "function") {
+    throw new Error("Text tokenizer does not expose chat templates for Gemma 3n.");
+  }
+  const model = await runtime.AutoModelForCausalLM.from_pretrained(candidate.model, {
+    ...candidate.textModelOptions,
+    progress_callback: progressCallback,
+  });
+  return {
+    runtimeKind: "text",
+    codec: tokenizer,
+    tokenizer,
+    model,
+    profile: candidate,
+  };
+}
+
+async function loadMultimodalBrowserSession(runtime, candidate, progressCallback) {
+  state.browserRuntimeMessage = `Local Gemma 3n multimodal runtime · ${candidate.label}`;
+  state.browserRuntimeProgressText = "Opening multimodal processor…";
+  renderHeaderStatus();
+  const processor = await runtime.AutoProcessor.from_pretrained(candidate.model, {
+    progress_callback: progressCallback,
+  });
+  const model = await runtime.AutoModelForImageTextToText.from_pretrained(
+    candidate.model,
+    {
+      ...candidate.multimodalModelOptions,
+      progress_callback: progressCallback,
+    },
+  );
+  return {
+    runtimeKind: "multimodal",
+    codec: processor,
+    processor,
+    model,
+    profile: candidate,
+  };
+}
+
+async function loadTransformersRuntime() {
+  if (state.transformersRuntimePromise) {
+    return state.transformersRuntimePromise;
+  }
+
+  state.transformersRuntimePromise = import(TRANSFORMERS_CDN)
+    .then((runtime) => {
+      runtime.env.allowRemoteModels = false;
+      runtime.env.allowLocalModels = true;
+      runtime.env.localModelPath = "/models";
+      runtime.env.useBrowserCache = true;
+
+      if (runtime.env.backends?.onnx?.wasm) {
+        runtime.env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+      }
+
+      return runtime;
+    })
+    .catch((error) => {
+      state.transformersRuntimePromise = null;
+      throw error;
+    });
+
+  return state.transformersRuntimePromise;
+}
+
+function warmBrowserSessionInBackground() {
+  if (state.browserWarmStarted) {
+    return;
+  }
+
+  state.browserWarmStarted = true;
+  state.browserRuntimeStatus = "warming";
+  state.browserRuntimeMessage = "Preparing Gemma 3n in the browser so Chronicle can run fully on device.";
+  state.browserRuntimeProgressText = "Loading model files…";
+  renderHeaderStatus();
+  ensureBrowserSession().catch((error) => {
+    console.warn("[Chronicle] Browser warmup failed.", error);
+  });
+}
+
+function detectBrowserCapabilities() {
+  const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
+  const deviceMemory = Number(navigator.deviceMemory || 0);
+  const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
+  const isMobile = typeof navigator !== "undefined"
+    && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+
+  return {
+    hasWebGPU,
+    deviceMemory,
+    hardwareConcurrency,
+    isMobile,
+  };
+}
+
+function calculateBrowserProfile(config) {
+  const maxSlices = 10;
+  let sliceCount = 1;
+
+  if (config.hasWebGPU) {
+    if (config.isMobile) {
+      sliceCount = config.deviceMemory >= 8 ? 2 : 1;
+    } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 12) {
+      sliceCount = 4;
+    } else if (config.deviceMemory >= 16 && config.hardwareConcurrency >= 10) {
+      sliceCount = 2;
+    }
+  }
+
+  sliceCount = Math.max(1, Math.min(sliceCount, maxSlices));
+  const percentage = Math.round((sliceCount / maxSlices) * 100);
+
+  return {
+    maxSlices,
+    sliceCount,
+    percentage,
+    label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
+    maxInputTokens: percentage >= 50 ? 1500 : percentage >= 25 ? 1240 : 980,
+    maxNewTokens: percentage >= 50 ? 900 : percentage >= 25 ? 760 : 620,
+    generationTimeoutMs: config.hasWebGPU ? 240000 : 300000,
+  };
+}
+
+function buildBrowserCandidates() {
+  const candidates = [];
+  const baseProfile = state.browserProfile || calculateBrowserProfile(state.browserCapabilities || detectBrowserCapabilities());
+  const sliceFallbacks = buildSliceFallbackChain(baseProfile.sliceCount, baseProfile.maxSlices);
+
+  MODEL_CANDIDATES.forEach((modelId) => {
+    if (state.browserCapabilities.hasWebGPU) {
+      sliceFallbacks.forEach((sliceCount) => {
+        candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
+      });
+    }
+    buildSliceFallbackChain(Math.min(baseProfile.sliceCount, 2), baseProfile.maxSlices).forEach((sliceCount) => {
+      candidates.push(buildBrowserCandidate(modelId, "wasm", sliceCount, baseProfile));
+    });
+  });
+
+  return dedupeCandidates(candidates);
+}
+
+function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
+  const sliceLabel = `${Math.round((sliceCount / baseProfile.maxSlices) * 100)}% slice (${sliceCount}/${baseProfile.maxSlices})`;
+  const textModelOptions = {
+    device,
+    dtype: GEMMA3N_TEXT_DTYPE_MAP,
+    model_kwargs: { num_slices: sliceCount },
+  };
+  const multimodalModelOptions = {
+    device,
+    dtype: GEMMA3N_DTYPE_MAP,
+    model_kwargs: { num_slices: sliceCount },
+  };
+
+  return {
+    device,
+    model: modelId,
+    label: `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}`,
+    sliceCount,
+    maxInputTokens: device === "webgpu"
+      ? Math.max(900, baseProfile.maxInputTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 120)
+      : Math.min(900, baseProfile.maxInputTokens),
+    maxNewTokens: device === "webgpu"
+      ? Math.max(560, baseProfile.maxNewTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 40)
+      : Math.min(620, baseProfile.maxNewTokens),
+    generationTimeoutMs: device === "webgpu"
+      ? Math.max(120000, baseProfile.generationTimeoutMs - Math.max(baseProfile.sliceCount - sliceCount, 0) * 15000)
+      : Math.max(180000, baseProfile.generationTimeoutMs),
+    textModelOptions,
+    multimodalModelOptions,
+  };
+}
+
+function buildSliceFallbackChain(targetSlices, maxSlices) {
+  const chain = [];
+  [targetSlices, Math.ceil(targetSlices * 0.5), 1].forEach((value) => {
+    const sliceCount = Math.max(1, Math.min(value, maxSlices));
+    if (!chain.includes(sliceCount)) {
+      chain.push(sliceCount);
+    }
+  });
+  return chain;
+}
+
+function dedupeCandidates(candidates) {
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    const key = `${candidate.device}:${candidate.model}:${candidate.sliceCount}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function getBrowserWarmupTimeoutMs() {
+  if (state.browserSession?.model) {
+    return 15000;
+  }
+  return state.browserCapabilities?.hasWebGPU ? 420000 : 540000;
+}
+
+async function waitForBrowserSessionReady() {
+  const loadPromise = ensureBrowserSession();
+  const deadline = Date.now() + getBrowserWarmupTimeoutMs();
+
+  while (true) {
+    const outcome = await Promise.race([
+      loadPromise.then((session) => ({ done: true, session })),
+      sleep(250).then(() => ({ done: false })),
+    ]);
+
+    if (outcome.done) {
+      return outcome.session;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error("Gemma 3n is taking too long to load on this device. Keep the tab open a little longer, then retry.");
+    }
+
+    advanceWarmupTailProgress();
+    const detail = getWarmupProgressLabel();
+    updateTurnStatus(`Loading Chronicle brain (${detail})`);
+    if (state.currentTurn?.stageNode && state.activeStageKey === "query") {
+      setStageState("query", "active", detail);
+    }
+  }
+}
+
+function beginBrowserLoad(candidate) {
+  state.browserLoadCandidate = candidate.label;
+  state.browserLoadProgressEntries = {};
+  state.browserLastProgressAt = Date.now();
+  state.browserRuntimeStatus = "warming";
+  state.browserRuntimeProgress = 0.06;
+  state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
+  state.browserRuntimeProgressText = "Preparing model files…";
+  renderHeaderStatus();
+}
+
+function createBrowserLoadProgressHandler(candidate) {
+  return (progressInfo) => {
+    updateBrowserLoadProgress(candidate, progressInfo);
+  };
+}
+
+function updateBrowserLoadProgress(candidate, progressInfo = {}) {
+  if (state.browserLoadCandidate !== candidate.label) {
+    beginBrowserLoad(candidate);
+  }
+
+  const key = cleanText(progressInfo.file || progressInfo.name || progressInfo.status || "");
+  const ratio = resolveLoadRatio(progressInfo);
+  if (key && ratio !== null) {
+    state.browserLoadProgressEntries[key] = ratio;
+    state.browserLastProgressAt = Date.now();
+  }
+
+  const progressValues = Object.values(state.browserLoadProgressEntries).filter((value) => Number.isFinite(value));
+  const average = progressValues.length
+    ? progressValues.reduce((sum, value) => sum + value, 0) / progressValues.length
+    : 0;
+
+  state.browserRuntimeStatus = "warming";
+  state.browserRuntimeProgress = clampNumber(0.08 + average * 0.88, 0.06, 0.98);
+  state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
+  state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}`;
+  renderHeaderStatus();
+}
+
+function resolveLoadRatio(progressInfo) {
+  if (Number.isFinite(progressInfo.progress)) {
+    return progressInfo.progress > 1 ? progressInfo.progress / 100 : progressInfo.progress;
+  }
+
+  if (Number.isFinite(progressInfo.loaded) && Number.isFinite(progressInfo.total) && progressInfo.total > 0) {
+    return progressInfo.loaded / progressInfo.total;
+  }
+
+  if (["done", "ready"].includes(cleanText(progressInfo.status).toLowerCase())) {
+    return 1;
+  }
+
+  return null;
+}
+
+function describeLoadProgress(progressInfo) {
+  const status = cleanText(progressInfo.status || "").toLowerCase();
+  const fileName = basename(cleanText(progressInfo.file || progressInfo.name || ""));
+  if (fileName) {
+    return fileName;
+  }
+  if (status === "initiate") {
+    return "Opening local model files";
+  }
+  if (status === "progress" || status === "download") {
+    return "Loading model shards";
+  }
+  if (status === "done" || status === "ready") {
+    return "Finalizing runtime";
+  }
+  return "Loading model files";
+}
+
+function advanceWarmupTailProgress() {
+  if (state.browserRuntimeStatus !== "warming") {
+    return;
+  }
+
+  const sinceLastProgress = Date.now() - (state.browserLastProgressAt || Date.now());
+  if (state.browserRuntimeProgress < 0.94 || sinceLastProgress < 1600) {
+    return;
+  }
+
+  const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU runtime" : "WASM runtime";
+  const tailProgress = clampNumber(
+    0.96 + (Math.min(sinceLastProgress - 1600, 36000) / 36000) * 0.035,
+    0.96,
+    0.995,
+  );
+  if (tailProgress > state.browserRuntimeProgress) {
+    state.browserRuntimeProgress = tailProgress;
+    state.browserRuntimeProgressText = `${Math.round(tailProgress * 100)}% · Finalizing ${runtimeLabel}`;
+    renderHeaderStatus();
+  }
+}
+
+function getWarmupProgressLabel() {
+  const percent = Math.round(clampNumber(state.browserRuntimeProgress || 0.04, 0.04, 0.99) * 100);
+  const detail = state.browserRuntimeProgressText || "Loading model files";
+  return `${percent}% · ${detail.replace(/^\d+%\s·\s/, "")}`;
+}
+
+async function preparePromptInputs(aiSession, promptText) {
+  const messages = aiSession.runtimeKind === "text"
+    ? [
+      {
+        role: "user",
+        content: promptText,
+      },
+    ]
+    : [
+      {
+        role: "user",
+        content: [{ type: "text", text: promptText }],
+      },
+    ];
+  const prompt = aiSession.codec.apply_chat_template(messages, {
+    add_generation_prompt: true,
+    tokenize: false,
+  });
+  const inputs = aiSession.runtimeKind === "text"
+    ? await aiSession.tokenizer(prompt, { add_special_tokens: false, return_tensor: true })
+    : await aiSession.processor(prompt, null, null, { add_special_tokens: false });
+
+  return {
+    prompt,
+    inputs,
+    inputLength: resolveInputLength(inputs.input_ids),
+  };
+}
+
+async function generateFromPreparedInputs(aiSession, prepared, options) {
+  await yieldToBrowser();
+  const output = await withTimeout(
+    aiSession.model.generate({
+      ...prepared.inputs,
+      max_new_tokens: options.maxNewTokens || aiSession.profile.maxNewTokens,
+      do_sample: Boolean(options.doSample),
+      temperature: options.doSample ? options.temperature || 0.7 : undefined,
+      top_p: options.doSample ? options.topP || 0.92 : undefined,
+      repetition_penalty: options.repetitionPenalty || 1.08,
+    }),
+    options.timeoutMs || aiSession.profile.generationTimeoutMs,
+    "Browser generation timed out before Chronicle could finish the step.",
+  );
+
+  const generatedTokens = output.slice(null, [prepared.inputLength, null]);
+  const decoded = aiSession.codec.batch_decode(generatedTokens, {
+    skip_special_tokens: true,
+  });
+  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
+
+  if (!generatedText) {
+    throw new Error("The browser model returned an empty response.");
+  }
+
+  await yieldToBrowser();
+  return generatedText;
+}
+
+function finalizeNewsletterMarkdown(markdown, run) {
+  let text = stripMarkdownFences(markdown).trim();
+  text = stripSourcesSection(text);
+
+  if (!/^#\s+/m.test(text)) {
+    text = `# ${run.queryPlan.title}\n\n${text}`;
+  }
+
+  const sourceSummaries = run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries;
+  return `${text.trim()}\n\n${buildSourcesSection(sourceSummaries, run.resultSummaries)}`.trim();
+}
+
+function buildSourcesSection(resultSummaries, allSummaries = resultSummaries) {
+  const seen = new Set();
+  const lines = [];
+
+  resultSummaries.forEach((summary) => {
+    const key = `${summary.source_title}::${summary.source_url}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    const index = allSummaries.findIndex((item) => item.result_id === summary.result_id) + 1;
+    lines.push(`[${index}]: ${summary.source_title} - ${summary.source_url}`);
+  });
+
+  return `## Sources\n${lines.join("\n")}`;
+}
+
+function appendResultCard(result) {
   const turn = ensureCurrentTurn();
   if (turn.completed) {
     return;
   }
 
-  void markdown;
   const card = ensureResultNode();
-  const resultTitle = run?.title || "Newsletter ready";
-  card.querySelector(".result-title").textContent = resultTitle;
-  card.querySelector(".message-body").textContent = "The newsletter is ready. Open the HTML issue to review and edit it.";
-  card.querySelector(".result-actions").innerHTML = `
-    ${run?.html_url ? `<a class="result-link result-link--primary" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML issue</a>` : ""}
-    ${run?.markdown_url ? `<a class="result-link" href="${escapeHtml(run.markdown_url)}" target="_blank" rel="noreferrer">Open markdown</a>` : ""}
+  card.querySelector(".result-title").textContent = result.title;
+  card.querySelector(".message-body").innerHTML = "<p>Newsletter is ready and can be opened.</p>";
+
+  const actions = card.querySelector(".result-actions");
+  actions.innerHTML = `
+    <button type="button" class="result-link result-link--primary" data-action="open">Click here to open</button>
+    <button type="button" class="result-link" data-action="download">Download HTML</button>
   `;
+
+  actions.querySelector('[data-action="open"]').addEventListener("click", () => {
+    try {
+      openHtmlIssue(result);
+    } catch (error) {
+      appendSystemMessage(error.message || "Chronicle could not open the HTML issue.");
+    }
+  });
+
+  actions.querySelector('[data-action="download"]').addEventListener("click", () => {
+    downloadHtmlIssue(result);
+  });
+
   turn.completed = true;
   scrollThreadToBottom();
 }
 
-function ensureResultNode() {
-  const turn = ensureCurrentTurn();
-  if (turn.resultNode) {
-    return turn.resultNode;
+function openHtmlIssue(result) {
+  const popup = window.open("", "_blank");
+  if (!popup) {
+    throw new Error("The browser blocked the issue window. Allow pop-ups to open the HTML issue.");
   }
 
-  const card = document.createElement("article");
-  card.className = "message message--assistant";
-  card.innerHTML = `
-    <div class="message-card result-card">
-      <p class="message-label">Chronicle</p>
-      <p class="result-title"></p>
-      <div class="result-actions"></div>
-      <div class="message-body"></div>
+  popup.document.open();
+  popup.document.write(result.htmlDocument);
+  popup.document.close();
+}
+
+function downloadHtmlIssue(result) {
+  const blob = new Blob([result.htmlDocument], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = result.downloadName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function renderEditableIssueHtml(title, markdown, storageKey) {
+  const renderedBody = markdownToHtml(markdown);
+  const safeTitle = escapeHtml(title);
+  const description = escapeHtml(extractPlainText(markdown).slice(0, 160));
+  const editionLabel = new Date().toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${safeTitle}</title>
+  <meta name="description" content="${description}">
+  <style>
+    :root {
+      --bg: #09111d;
+      --panel: rgba(10, 18, 31, 0.94);
+      --panel-soft: rgba(18, 28, 46, 0.92);
+      --line: rgba(255, 255, 255, 0.09);
+      --ink: #eef3fb;
+      --muted: #91a4bf;
+      --accent: #ff925d;
+      --accent-2: #ffd07f;
+      --display: "Ivar Display", "Noe Display", Georgia, serif;
+      --ui: "Satoshi", "Avenir Next", sans-serif;
+      --mono: "SFMono-Regular", Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+
+    body {
+      color: var(--ink);
+      font-family: var(--ui);
+      background:
+        radial-gradient(circle at 12% 14%, rgba(255, 146, 93, 0.18), transparent 24%),
+        radial-gradient(circle at 84% 10%, rgba(111, 232, 255, 0.16), transparent 22%),
+        linear-gradient(180deg, #07101b 0%, #0a1320 100%);
+    }
+
+    .shell {
+      width: min(1180px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 18px 0 42px;
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 18px;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 18px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(6, 11, 19, 0.84);
+      backdrop-filter: blur(18px);
+    }
+
+    .toolbar-copy {
+      display: grid;
+      gap: 4px;
+    }
+
+    .kicker {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.75rem;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .toolbar-title {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .toolbar-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 11px 16px;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.05);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button.primary {
+      color: #180f07;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color: rgba(255, 146, 93, 0.38);
+    }
+
+    .card {
+      margin-top: 18px;
+      border-radius: 30px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--panel), var(--panel-soft));
+      overflow: hidden;
+    }
+
+    .meta {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 20px 24px 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .editor {
+      min-height: 72vh;
+      padding: 24px;
+      outline: none;
+      line-height: 1.72;
+      font-size: 1.05rem;
+    }
+
+    .editor h1, .editor h2, .editor h3 {
+      font-family: var(--display);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      margin: 0 0 16px;
+    }
+
+    .editor h1 { font-size: clamp(2.8rem, 7vw, 5rem); }
+    .editor h2 { font-size: clamp(1.5rem, 3vw, 2.2rem); margin-top: 34px; }
+    .editor h3 { font-size: 1.2rem; margin-top: 24px; }
+    .editor p { margin: 0 0 16px; color: rgba(238, 243, 251, 0.94); }
+    .editor ul { margin: 0 0 18px 20px; padding: 0; }
+    .editor li { margin-bottom: 10px; }
+    .editor code { font-family: var(--mono); background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 6px; }
+
+    .foot {
+      padding: 0 24px 22px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="toolbar">
+      <div class="toolbar-copy">
+        <p class="kicker">Chronicle HTML editor</p>
+        <p class="toolbar-title">${safeTitle}</p>
+      </div>
+      <div class="toolbar-actions">
+        <button type="button" id="restore-button">Restore saved draft</button>
+        <button type="button" id="download-button" class="primary">Download HTML</button>
+      </div>
     </div>
-  `;
-  elements.chatThread.appendChild(card);
-  turn.resultNode = card;
-  scrollThreadToBottom();
-  return card;
-}
 
-function updateLiveDraft(text) {
-  void text;
-}
+    <div class="card">
+      <div class="meta">
+        <span>${escapeHtml(editionLabel)}</span>
+        <span>Editable issue</span>
+      </div>
+      <article id="editor" class="editor" contenteditable="true" spellcheck="true">${renderedBody}</article>
+      <div class="foot">This issue lives entirely in your browser. Changes are stored locally on this device.</div>
+    </div>
+  </div>
 
-function upsertReasoningSummary(text) {
-  void text;
-}
+  <script>
+    const storageKey = ${JSON.stringify(storageKey)};
+    const downloadName = ${JSON.stringify(`${slugify(title)}-editable.html`)};
+    const editor = document.getElementById("editor");
+    const restoreButton = document.getElementById("restore-button");
+    const downloadButton = document.getElementById("download-button");
 
-function finishTurnWithError(message) {
-  setGenerateBusy(false);
-  stopPolling();
-  updateTurnStatus("Run failed.");
-  setStageState("generate", "error");
-  appendSystemMessage(message);
-}
+    const cached = window.localStorage.getItem(storageKey);
+    if (cached) {
+      editor.innerHTML = cached;
+    }
 
-async function runBrowserGeneration(payload) {
-  setStageState("research", "active");
-  updateTurnStatus("Extracting web info");
-  const researchResponse = await fetchJSON("/api/research", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const research = researchResponse.research;
-  const packet = buildEditorialPacket(research);
-  setStageState("research", "complete");
-  setStageState("brain", "active");
-  updateTurnStatus("Sending to Chronicle brain");
-
-  let markdown = "";
-  let usedServerFallback = false;
-
-  try {
-    const aiSession = await withTimeout(
-      ensureBrowserSession(),
-      getBrowserWarmupTimeoutMs(),
-      "Browser model is still warming up on this device.",
-    );
-    setStageState("brain", "complete");
-    setStageState("generate", "active");
-    updateTurnStatus("Generating newsletter locally");
-
-    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
-      void partialText;
+    editor.addEventListener("input", () => {
+      window.localStorage.setItem(storageKey, editor.innerHTML);
     });
-    const cleaned = stripMarkdownFences(generatedMarkdown).trim();
-    if (cleaned.length < 200) {
-      throw new Error("Browser model produced too little output.");
-    }
-    markdown = finalizeNewsletterMarkdown(cleaned, packet);
-  } catch (browserError) {
-    console.error("[Chronicle] Browser generation FAILED:", browserError?.message || browserError);
-    reportClientError("browser_generation", browserError);
-    setStageState("brain", "complete");
-    setStageState("generate", "active");
-    updateTurnStatus("Retrying with simpler prompt");
 
-    try {
-      const aiSession = await withTimeout(
-        ensureBrowserSession(),
-        getBrowserRetryWarmupTimeoutMs(),
-        "Browser model could not finish warming up for retry.",
-      );
-      const retryMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, () => {}, true);
-      const retryCleaned = stripMarkdownFences(retryMarkdown).trim();
-      console.log("[Chronicle] Retry output length:", retryCleaned.length);
-      if (retryCleaned.length >= 150) {
-        markdown = finalizeNewsletterMarkdown(retryCleaned, packet);
-      } else {
-        throw new Error("Retry produced too little: " + retryCleaned.length + " chars");
+    restoreButton.addEventListener("click", () => {
+      const saved = window.localStorage.getItem(storageKey);
+      if (saved) {
+        editor.innerHTML = saved;
       }
-    } catch (retryError) {
-      console.error("[Chronicle] Retry ALSO FAILED:", retryError?.message || retryError);
-      reportClientError("browser_retry", retryError);
-      usedServerFallback = true;
-      markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
-    }
-  }
+    });
 
-  const normalizedMarkdown = finalizeNewsletterMarkdown(markdown, packet);
-  const title = extractTitleFromMarkdown(normalizedMarkdown, packet.title);
-
-  updateTurnStatus("Saving newsletter");
-
-  const saveResponse = await fetchJSON("/api/runs/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      brief: payload.brief,
-      title,
-      markdown: normalizedMarkdown,
-      depth: payload.depth,
-      explanation_style: payload.explanation_style,
-      style_instructions: payload.style_instructions,
-      audience: packet.audience,
-      tone: packet.tone,
-      queries: packet.queries,
-      sections: packet.sections,
-      sources: packet.selectedSources.map((source) => ({
-        ...source,
-        source_summary: source.sourceText,
-        relevance_score: source.relevanceScore,
-      })),
-    }),
-  });
-
-  setGenerateBusy(false);
-  setStageState("generate", "complete", usedServerFallback ? "Backup issue ready" : "Issue ready");
-  updateTurnStatus(`Issue ready: ${saveResponse.run.title}`);
-  appendResultCard(saveResponse.run, normalizedMarkdown);
-  await refreshStatus();
-}
-
-async function waitForServerJob(jobId) {
-  return new Promise((resolve, reject) => {
-    state.activeJobId = jobId;
-    stopPolling();
-    state.pollTimer = window.setInterval(async () => {
-      try {
-        const response = await fetchJSON(`/api/jobs/${jobId}`);
-        renderJobState(response.job);
-        if (response.job.status === "completed") {
-          stopPolling();
-          resolve(response.job);
-        } else if (response.job.status === "failed") {
-          stopPolling();
-          reject(new Error(response.job.error?.message || "Server generation failed."));
-        }
-      } catch (error) {
-        stopPolling();
-        reject(error);
-      }
-    }, 1500);
-  });
-}
-
-async function startServerGeneration(payload) {
-  const response = await fetchJSON("/api/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  state.activeJobId = response.job.id;
-  renderJobState(response.job);
-  startPolling(response.job.id);
-}
-
-function renderJobState(job) {
-  if (!job) {
-    return;
-  }
-
-  if (job.status === "queued" || job.status === "running") {
-    setGenerateBusy(true);
-    setStageState("research", "complete");
-    setStageState("brain", "complete");
-    setStageState("generate", "active");
-  }
-  updateTurnStatus(job.message || "Chronicle is working…");
-
-  if (job.status === "failed") {
-    setStageState("generate", "error");
-    finishTurnWithError(job.error?.message || job.message || "Chronicle failed to finish the run.");
-    return;
-  }
-
-  if (job.status === "completed") {
-    setGenerateBusy(false);
-    setStageState("generate", "complete", "Issue ready");
-    stopPolling();
-    if (job.result) {
-      appendResultCard(job.result, "");
-    }
-    refreshStatus().catch(console.error);
-  }
-}
-
-function appendJobLogs(job) {
-  void job;
-}
-
-function startPolling(jobId) {
-  state.activeJobId = jobId;
-  stopPolling();
-  state.pollTimer = window.setInterval(async () => {
-    try {
-      const response = await fetchJSON(`/api/jobs/${jobId}`);
-      renderJobState(response.job);
-    } catch (error) {
-      finishTurnWithError(error.message || "Chronicle lost contact with the local server.");
-    }
-  }, 1500);
-}
-
-function stopPolling() {
-  if (state.pollTimer) {
-    window.clearInterval(state.pollTimer);
-    state.pollTimer = null;
-  }
-}
-
-async function refreshStatus() {
-  const statusResponse = await fetchJSON("/api/status");
-  applyStatus(statusResponse);
-}
-
-function canUseServerFallback() {
-  return Boolean(state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready);
-}
-
-function ensureCurrentTurn() {
-  if (!state.currentTurn) {
-    startRecoveredTurn();
-  }
-  return state.currentTurn;
+    downloadButton.addEventListener("click", () => {
+      const htmlText = document.documentElement.outerHTML;
+      const blob = new Blob([htmlText], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = downloadName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>`;
 }
 
 function appendUserMessage(text) {
@@ -507,6 +2268,7 @@ function appendSystemMessage(text, label = "") {
 }
 
 function appendMessage(role, text, label = "") {
+  dismissEmptyState();
   const article = document.createElement("article");
   article.className = `message message--${role}`;
   article.innerHTML = `
@@ -522,17 +2284,11 @@ function appendMessage(role, text, label = "") {
 }
 
 function appendStageCard() {
+  dismissEmptyState();
   const article = document.createElement("article");
   article.className = "message message--assistant";
   article.innerHTML = `
     <div class="stage-card">
-      <div class="stage-header">
-        <div>
-          <p class="message-label">Chronicle pipeline</p>
-          <p class="stage-title">Three-stage generation flow</p>
-        </div>
-        <p class="stage-meta">Live</p>
-      </div>
       <div class="stage-list">
         ${TURN_STAGES.map((stage) => `
           <div class="stage-item is-pending" data-stage="${stage.key}">
@@ -580,6 +2336,47 @@ function setStageState(stageKey, status, detail = "") {
   scrollThreadToBottom();
 }
 
+function ensureCurrentTurn() {
+  if (!state.currentTurn) {
+    startNewTurn("Chronicle");
+  }
+  return state.currentTurn;
+}
+
+function ensureResultNode() {
+  const turn = ensureCurrentTurn();
+  if (turn.resultNode) {
+    return turn.resultNode;
+  }
+
+  dismissEmptyState();
+  const card = document.createElement("article");
+  card.className = "message message--assistant";
+  card.innerHTML = `
+    <div class="message-card result-card">
+      <p class="message-label">Newsletter</p>
+      <p class="result-title"></p>
+      <div class="result-actions"></div>
+      <div class="message-body"></div>
+    </div>
+  `;
+  elements.chatThread.appendChild(card);
+  turn.resultNode = card;
+  scrollThreadToBottom();
+  return card;
+}
+
+function finishTurnWithError(message) {
+  setGenerateBusy(false);
+  if (state.currentTurn?.statusNode) {
+    updateTurnStatus("Run failed.");
+  }
+  if (state.currentTurn?.stageNode && state.activeStageKey) {
+    setStageState(state.activeStageKey, "error", "Blocked");
+  }
+  appendSystemMessage(message);
+}
+
 function setGenerateBusy(isBusy) {
   elements.generateButton.disabled = isBusy;
   elements.generateButton.textContent = isBusy ? "Working…" : "Send";
@@ -589,7 +2386,7 @@ function toggleCustomStyleField(visible) {
   elements.customStyleField.classList.toggle("is-hidden", !visible);
 }
 
-function setStatusPill(text, modifierClass) {
+function setStatusPill(text, modifierClass = "") {
   elements.statusPill.textContent = text;
   elements.statusPill.classList.remove("is-warm", "is-danger");
   if (modifierClass) {
@@ -597,848 +2394,81 @@ function setStatusPill(text, modifierClass) {
   }
 }
 
+function dismissEmptyState() {
+  if (elements.emptyState) {
+    elements.emptyState.remove();
+    elements.emptyState = null;
+  }
+}
+
 function scrollThreadToBottom() {
   elements.chatThread.scrollTop = elements.chatThread.scrollHeight;
 }
 
-function buildEditorialPacket(research) {
-  const topicProfile = buildTopicProfile(research.brief, research.plan?.title || "");
-  const selectedSources = selectTopSources(
-    research.sources || [],
-    research.depth === "high" ? 8 : 6,
-    topicProfile,
-  );
+function markdownToHtml(markdown) {
+  const lines = stripMarkdownFences(markdown).split(/\r?\n/);
+  const html = [];
+  let inList = false;
 
-  return {
-    brief: research.brief,
-    title: research.plan?.title || "Newsletter",
-    audience: research.plan?.audience || "General readers",
-    tone: research.plan?.tone || "Sharp and analytical",
-    days: research.days,
-    depth: research.depth,
-    explanationStyle: research.explanation_style,
-    styleInstructions: research.style_instructions || "",
-    queries: research.plan?.queries || [],
-    sections: research.plan?.sections || ["What happened", "Why it matters", "What to watch next"],
-    marketSnapshot: research.market_snapshot || [],
-    topicProfile,
-    editorialAngle: buildEditorialAngle(research, topicProfile, selectedSources),
-    selectedSources,
-  };
-}
-
-function selectTopSources(sources, limit, topicProfile) {
-  const deduped = [];
-  const seen = new Set();
-
-  const ranked = sources
-    .map((source, index) => ({
-      ...source,
-      sourceText: trimText(extractEvidenceText(source), 320),
-      relevanceScore: rankSourceForDraft(source, index, topicProfile),
-    }))
-    .sort((left, right) => right.relevanceScore - left.relevanceScore)
-    .filter((source) => source.relevanceScore >= minimumSourceScore(topicProfile));
-
-  (ranked.length ? ranked : sources
-    .map((source, index) => ({
-      ...source,
-      sourceText: trimText(extractEvidenceText(source), 320),
-      relevanceScore: rankSourceForDraft(source, index, topicProfile),
-    }))
-    .sort((left, right) => right.relevanceScore - left.relevanceScore))
-    .forEach((source) => {
-      const key = normalizeSourceIdentity(source);
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      deduped.push(source);
-    });
-
-  return deduped.slice(0, limit);
-}
-
-function rankSourceForDraft(source, index, topicProfile) {
-  let score = 12 - index * 0.35;
-  const title = cleanupSourceTitle(source.title);
-  const text = `${title} ${source.snippet || ""} ${source.source_text || ""}`.toLowerCase();
-  const includeHits = (topicProfile?.includeTerms || []).filter((term) => containsTopicTerm(text, term)).length;
-  const excludeHits = (topicProfile?.excludeTerms || []).filter((term) => containsTopicTerm(text, term)).length;
-
-  score += includeHits * 2.4;
-  if (topicProfile?.includeTerms?.length && includeHits === 0) {
-    score -= 3.5;
-  }
-  score -= excludeHits * 4;
-  if (source.snippet) {
-    score += 0.5;
-  }
-  if (source.source_text) {
-    score += Math.min(1.5, source.source_text.length / 260);
-  }
-  if (source.article_text) {
-    score += 1.5;
-  }
-  if (/\b(opinion|editorial|column|op-ed|analysis)\b/i.test(title)) {
-    score -= 2.2;
-  }
-  if (/\b(university|college|campus|student|athletics|in memory|obituary)\b/i.test(text)) {
-    score -= 3;
-  }
-  if (/\b(reuters|associated press|ap news|new york times|financial times|wall street journal|bloomberg)\b/i.test(`${title} ${source.url || ""}`)) {
-    score += 1.4;
-  }
-  return score;
-}
-
-function minimumSourceScore(topicProfile) {
-  return topicProfile?.includeTerms?.length ? 8.5 : 6.5;
-}
-
-function buildTopicProfile(brief, plannedTitle = "") {
-  const normalized = String(brief || "").trim();
-  const lowered = normalized.toLowerCase();
-  const briefTokens = extractBriefTokens(normalized);
-  const plannedTokens = extractBriefTokens(plannedTitle);
-  const aliasKey = TOPIC_ALIASES[lowered]
-    ? lowered
-    : (briefTokens.length === 1 && TOPIC_ALIASES[briefTokens[0]] ? briefTokens[0] : "");
-  const alias = aliasKey ? TOPIC_ALIASES[aliasKey] : null;
-
-  const canonical = alias?.canonical || plannedTitle || normalized;
-  const includeTerms = alias?.include?.length ? alias.include : [...new Set([...briefTokens, ...plannedTokens])].slice(0, 6);
-  const excludeTerms = alias?.exclude || [];
-
-  return {
-    canonical,
-    includeTerms,
-    excludeTerms,
-  };
-}
-
-function extractBriefTokens(text) {
-  return (String(text || "").toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) || [])
-    .filter((token, index, all) => all.indexOf(token) === index)
-    .slice(0, 6);
-}
-
-function containsTopicTerm(text, term) {
-  return String(text || "").includes(String(term || "").toLowerCase());
-}
-
-function buildEditorialAngle(research, topicProfile, selectedSources) {
-  const focus = topicProfile?.canonical || research.brief;
-  const titles = selectedSources.slice(0, 2).map((source) => cleanupSourceTitle(source.title));
-
-  if (!titles.length) {
-    return `The reporting window around ${focus} is thin, so the issue should stay explicit about uncertainty and avoid overclaiming.`;
-  }
-  if (titles.length === 1) {
-    return `The strongest verified signal around ${focus} is not a flood of headlines but the direction implied by ${titles[0]} [1].`;
-  }
-  return `The strongest verified signal around ${focus} is the convergence between ${titles[0]} [1] and ${titles[1]} [2], not any single isolated headline.`;
-}
-
-function normalizeSourceIdentity(source) {
-  const titleKey = cleanupSourceTitle(source.title)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-
-  try {
-    const parsed = new URL(source.url || "", window.location.origin);
-    if (parsed.hostname.includes("news.google.com")) {
-      return `title:${titleKey}`;
+  function closeList() {
+    if (inList) {
+      html.push("</ul>");
+      inList = false;
     }
-    return `url:${parsed.hostname}${parsed.pathname}`;
-  } catch (error) {
-    return `title:${titleKey}`;
-  }
-}
-
-function isIndirectSource(source) {
-  return /news\.google\.com/i.test(source?.url || "");
-}
-
-function cleanupSourceTitle(title) {
-  return String(title || "")
-    .replace(/\s+-\s+(Reuters|AP News|Associated Press|MSN|AOL\.com|Yahoo!?\s*News|DW\.com)$/i, "")
-    .trim();
-}
-
-function extractEvidenceText(source) {
-  const title = cleanupSourceTitle(source?.title || "");
-  const snippet = cleanEvidenceForPrompt(String(source?.snippet || "").trim(), title);
-  const article = cleanEvidenceForPrompt(String(source?.article_text || source?.source_text || "").trim(), title);
-  if (article) {
-    return trimText(article, 240);
-  }
-  if (snippet) {
-    return trimText(snippet, 180);
-  }
-  return title;
-}
-
-function cleanEvidenceForPrompt(text, title = "") {
-  let value = String(text || "")
-    .replace(/\b(title|url|evidence)\s*:\s*/gi, " ")
-    .replace(/https?:\/\/\S+/gi, " ")
-    .replace(/\[[0-9]+\]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!value) {
-    return "";
   }
 
-  if (title) {
-    const escapedTitle = escapeRegExp(cleanupSourceTitle(title));
-    value = value.replace(new RegExp(`^${escapedTitle}[\\s:;,.\\-–—]+`, "i"), "").trim();
-  }
-
-  const sentences = value.match(/[^.!?]+[.!?]?/g) || [value];
-  const unique = [];
-  const seen = new Set();
-
-  sentences.forEach((sentence) => {
-    const cleanedSentence = String(sentence || "").replace(/\s+/g, " ").trim();
-    if (!cleanedSentence) {
+  lines.forEach((line) => {
+    const stripped = line.trim();
+    if (!stripped) {
+      closeList();
       return;
     }
-    const key = cleanedSentence.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    if (!key || seen.has(key)) {
+
+    if (stripped.startsWith("# ")) {
+      closeList();
+      html.push(`<h1>${formatInlineMarkdown(stripped.slice(2).trim())}</h1>`);
       return;
     }
-    seen.add(key);
-    unique.push(cleanedSentence);
-  });
 
-  return unique.join(" ").trim();
-}
+    if (stripped.startsWith("## ")) {
+      closeList();
+      html.push(`<h2>${formatInlineMarkdown(stripped.slice(3).trim())}</h2>`);
+      return;
+    }
 
-function finalizeNewsletterMarkdown(markdown, packet) {
-  let text = String(markdown || "").trim();
-  if (!text) {
-    text = renderFallbackNewsletter(packet);
-  }
-  if (!/^#\s+/m.test(text)) {
-    text = `# ${packet.title}\n\n${text}`;
-  }
-  if (!/\n##\s+Sources\b/i.test(text)) {
-    text = `${text.trim()}\n\n${buildSourcesSection(packet)}`;
-  }
-  return text.trim();
-}
+    if (stripped.startsWith("### ")) {
+      closeList();
+      html.push(`<h3>${formatInlineMarkdown(stripped.slice(4).trim())}</h3>`);
+      return;
+    }
 
-function renderFallbackNewsletter(packet) {
-  const sources = packet.selectedSources;
-  const lines = [
-    `# ${packet.title}`,
-    "",
-    buildFallbackLead(packet),
-    "",
-  ];
-
-  if (sources.length) {
-    packet.sections.slice(0, 3).forEach((sectionName, index) => {
-      lines.push(`## ${sectionName}`);
-      lines.push("");
-      lines.push(buildFallbackSection(packet, sectionName, index));
-      lines.push("");
-    });
-  } else {
-    lines.push("## Note");
-    lines.push("");
-    lines.push(`Coverage around ${packet.topicProfile?.canonical || packet.brief} was too thin in this run to support a stronger issue.`);
-    lines.push("");
-  }
-
-  lines.push(buildSourcesSection(packet));
-  return lines.join("\n");
-}
-
-function buildFallbackLead(packet) {
-  const focus = packet.topicProfile?.canonical || packet.brief;
-  const titles = packet.selectedSources.slice(0, 2).map((source, index) => `${cleanupSourceTitle(source.title)} [${index + 1}]`);
-  if (!titles.length) {
-    return `This issue stays cautious because Chronicle did not verify enough reporting on ${focus} to support a stronger lead.`;
-  }
-  return `${packet.editorialAngle} For this issue, the reporting window is anchored by ${titles.join(" and ")}, which together define the strongest through-line Chronicle could verify on ${focus}.`;
-}
-
-function buildFallbackSection(packet, sectionName, index) {
-  const focus = packet.topicProfile?.canonical || packet.brief;
-  const primary = packet.selectedSources[index] || packet.selectedSources[0];
-  const secondary = packet.selectedSources[index + 1] || packet.selectedSources[1] || packet.selectedSources[0];
-  const primaryIndex = packet.selectedSources.indexOf(primary) + 1;
-  const secondaryIndex = packet.selectedSources.indexOf(secondary) + 1;
-  const primaryTitle = cleanupSourceTitle(primary?.title || "");
-  const secondaryTitle = cleanupSourceTitle(secondary?.title || "");
-  const themes = extractThemeTerms(packet.selectedSources, 2);
-  const themeClause = themes.length >= 2
-    ? `${themes[0]} and ${themes[1]}`
-    : themes[0] || focus;
-  const lower = sectionName.toLowerCase();
-
-  if (lower.includes("what happened")) {
-    return `The reporting window was led by ${primaryTitle} [${primaryIndex}]. ${secondaryTitle && secondaryIndex !== primaryIndex ? `${secondaryTitle} [${secondaryIndex}] reinforced the same frame rather than overturning it.` : ""} The important point is that the coverage clustered around ${focus}, not a random scatter of mentions.`;
-  }
-  if (lower.includes("why it matters")) {
-    return `For readers tracking ${focus}, the deeper signal is not any one update but the way the reporting is clustering around ${themeClause}. ${primaryTitle} [${primaryIndex}] is useful here because it points to a durable direction rather than a one-off headline.`;
-  }
-  if (lower.includes("watch")) {
-    return `The next thing to watch is whether the same pattern holds in the next reporting cycle. If the line from ${primaryTitle} [${primaryIndex}] to ${secondaryTitle} [${secondaryIndex}] keeps strengthening, Chronicle should treat that as the real center of gravity for ${focus}.`;
-  }
-  return `The clearest development remains the overlap between ${primaryTitle} [${primaryIndex}] and ${secondaryTitle} [${secondaryIndex}], which together give Chronicle the best evidence for the current direction of ${focus}.`;
-}
-
-function extractThemeTerms(sources, limit) {
-  const stopwords = new Set(["about", "after", "amid", "analysis", "latest", "news", "says", "this", "that", "their", "what", "when", "where", "with"]);
-  const scores = new Map();
-
-  sources.forEach((source) => {
-    const text = `${cleanupSourceTitle(source.title)} ${source.snippet || ""}`.toLowerCase();
-    const words = text.match(/[a-z][a-z0-9-]{2,}/g) || [];
-    const seen = new Set();
-    words.forEach((word) => {
-      if (stopwords.has(word) || seen.has(word)) {
-        return;
+    if (stripped.startsWith("- ")) {
+      if (!inList) {
+        html.push("<ul>");
+        inList = true;
       }
-      seen.add(word);
-      scores.set(word, (scores.get(word) || 0) + 1);
-    });
-  });
-
-  return [...scores.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, limit)
-    .map(([term]) => term);
-}
-
-function buildSourcesSection(packet) {
-  const sources = packet.selectedSources.length
-    ? packet.selectedSources
-      .map((source, index) => `[${index + 1}]: ${cleanupSourceTitle(source.title)} - ${source.url}`)
-      .join("\n")
-    : "No external sources were successfully collected.";
-
-  const marketLine = packet.marketSnapshot?.length
-    ? "\n[M1]: CoinGecko Markets API - https://www.coingecko.com/"
-    : "";
-
-  return `## Sources\n${sources}${marketLine}`;
-}
-
-
-function detectBrowserCapabilities(browserConfig) {
-  const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
-  const deviceMemory = Number(navigator.deviceMemory || 0);
-  const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
-  const hostAvailableMemory = Number(state.serverRuntime?.memory_available_gb || 0);
-  const isMobile = typeof navigator !== "undefined"
-    && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
-  const recommendedProfile = calculateBrowserProfile({
-    hasWebGPU,
-    deviceMemory,
-    hardwareConcurrency,
-    hostAvailableMemory,
-    isMobile,
-    supportsSlicing: Boolean(browserConfig?.supports_slicing),
-    maxSlices: Number(browserConfig?.max_slices || 1),
-  });
-  const candidates = buildBrowserCandidates(browserConfig, recommendedProfile, {
-    hasWebGPU,
-    deviceMemory,
-    hardwareConcurrency,
-    isMobile,
-  });
-
-  return {
-    hasWebGPU,
-    deviceMemory,
-    hardwareConcurrency,
-    isMobile,
-    recommendedProfile,
-    candidates,
-  };
-}
-
-async function ensureBrowserSession() {
-  if (state.browserSession?.model) {
-    return state.browserSession;
-  }
-  if (state.browserSessionPromise) {
-    return state.browserSessionPromise;
-  }
-
-  if (!state.browserConfig?.local_model_ready || !state.browserConfig?.local_model_id) {
-    throw new Error("No local browser model bundle is available on this server.");
-  }
-
-  state.browserSessionPromise = loadBrowserSession()
-    .then((session) => {
-      state.browserSession = session;
-      return session;
-    })
-    .catch((error) => {
-      state.browserSession = null;
-      throw error;
-    })
-    .finally(() => {
-      state.browserSessionPromise = null;
-    });
-
-  return state.browserSessionPromise;
-}
-
-async function loadBrowserSession() {
-  const { AutoModelForImageTextToText, AutoProcessor, TextStreamer, env } = await loadTransformersRuntime();
-
-  let lastError = null;
-  for (const candidate of state.browserCapabilities.candidates) {
-    try {
-      console.log(`[Chronicle] Loading browser candidate: ${candidate.label}`);
-      const processor = await AutoProcessor.from_pretrained(candidate.model);
-      const model = await AutoModelForImageTextToText.from_pretrained(
-        candidate.model,
-        candidate.modelOptions,
-      );
-      return {
-        processor,
-        model,
-        TextStreamer,
-        profile: candidate,
-      };
-    } catch (error) {
-      lastError = error;
-      console.warn(`Chronicle browser candidate failed: ${candidate.label}`, error);
+      html.push(`<li>${formatInlineMarkdown(stripped.slice(2).trim())}</li>`);
+      return;
     }
-  }
 
-  throw new Error(lastError?.message || "No browser inference backend could be initialized.");
-}
-
-async function loadTransformersRuntime() {
-  if (state.transformersRuntimePromise) {
-    return state.transformersRuntimePromise;
-  }
-
-  state.transformersRuntimePromise = import(TRANSFORMERS_CDN)
-    .then((runtime) => {
-      runtime.env.allowRemoteModels = false;
-      runtime.env.allowLocalModels = true;
-      runtime.env.localModelPath = "/models";
-      runtime.env.useBrowserCache = true;
-
-      if (runtime.env.backends?.onnx?.wasm) {
-        runtime.env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-      }
-      return runtime;
-    })
-    .catch((error) => {
-      state.transformersRuntimePromise = null;
-      throw error;
-    });
-
-  return state.transformersRuntimePromise;
-}
-
-function warmBrowserSessionInBackground() {
-  if (state.browserWarmStarted || !state.browserConfig?.local_model_ready) {
-    return;
-  }
-  state.browserWarmStarted = true;
-  ensureBrowserSession().catch((error) => {
-    console.warn("[Chronicle] Background browser warmup failed.", error);
-  });
-}
-
-function getBrowserWarmupTimeoutMs() {
-  if (state.browserSession?.model) {
-    return 15000;
-  }
-  return state.browserCapabilities?.hasWebGPU ? 180000 : 240000;
-}
-
-function getBrowserRetryWarmupTimeoutMs() {
-  if (state.browserSession?.model) {
-    return 15000;
-  }
-  return state.browserCapabilities?.hasWebGPU ? 240000 : 300000;
-}
-
-async function generateNewsletterMarkdown(research, packet, aiSession, onProgress, isRetry = false) {
-  const promptVariants = buildPromptVariants(research, packet, isRetry);
-  let selectedVariant = null;
-  let selectedInputs = null;
-  let inputLength = 0;
-
-  for (const variant of promptVariants) {
-    const prepared = await preparePromptInputs(aiSession, variant.promptText);
-    if (!prepared.inputLength) {
-      continue;
-    }
-    if (prepared.inputLength > aiSession.profile.maxInputTokens) {
-      console.warn(
-        `[Chronicle] Prompt variant "${variant.label}" too large: ${prepared.inputLength} tokens (limit ${aiSession.profile.maxInputTokens}).`,
-      );
-      continue;
-    }
-    selectedVariant = variant;
-    selectedInputs = prepared.inputs;
-    inputLength = prepared.inputLength;
-    break;
-  }
-
-  if (!selectedVariant || !selectedInputs || !inputLength) {
-    throw new Error("Chronicle could not fit the newsletter prompt into the local model context window.");
-  }
-
-  console.log(
-    `[Chronicle] Using prompt variant "${selectedVariant.label}" with ${inputLength} input tokens.`,
-  );
-
-  let streamedText = "";
-  const streamer = aiSession.TextStreamer
-    ? new aiSession.TextStreamer(aiSession.processor.tokenizer, {
-      skip_prompt: true,
-      skip_special_tokens: true,
-      callback_function: (text) => {
-        streamedText += text;
-        onProgress?.(streamedText);
-      },
-    })
-    : null;
-
-  const output = await withTimeout(
-    aiSession.model.generate({
-      ...selectedInputs,
-      max_new_tokens: aiSession.profile.maxNewTokens,
-      do_sample: false,
-      repetition_penalty: 1.15,
-      streamer,
-    }),
-    aiSession.profile.generationTimeoutMs,
-    "Browser generation timed out before the newsletter finished.",
-  );
-  const generatedTokens = output.slice(null, [inputLength, null]);
-  const decoded = aiSession.processor.batch_decode(generatedTokens, {
-    skip_special_tokens: true,
-  });
-  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
-
-  console.log("[Chronicle] Generated text length:", (generatedText || "").length, "streamed:", streamedText.length);
-  if (!generatedText && !streamedText.trim()) {
-    throw new Error("Browser model returned an empty response.");
-  }
-  return generatedText || streamedText;
-}
-
-function buildModeSystemPrompt(packet) {
-  if (packet.explanationStyle === "feynman") {
-    return "You are Chronicle. Think silently, find the central argument in the research notes, and explain it simply in markdown.";
-  }
-  if (packet.explanationStyle === "soc") {
-    return "You are Chronicle. Think silently, form one argument, and write the newsletter as a sequence of sharp questions and answers in markdown.";
-  }
-  if (packet.explanationStyle === "custom" && packet.styleInstructions) {
-    return `You are Chronicle. Think silently, form one argument, and follow this style exactly: ${trimText(packet.styleInstructions, 160)}. Write in markdown.`;
-  }
-  return "You are Chronicle. Think silently, form one clear argument from the research notes, and write a concise analytical newsletter in markdown.";
-}
-
-function buildMinimalPrompt(research, packet) {
-  return buildNewsletterPrompt(research, packet, {
-    sourceLimit: 2,
-    evidenceChars: 70,
-    briefChars: 120,
-    sectionLimit: 3,
-    wordRange: "420-560",
-  });
-}
-
-function buildNewsletterPrompt(research, packet, options = {}) {
-  const maxSources = Math.max(1, options.sourceLimit || 3);
-  const evidenceChars = Math.max(50, options.evidenceChars || 100);
-  const briefChars = Math.max(80, options.briefChars || 180);
-  const sectionLimit = Math.max(2, options.sectionLimit || 3);
-  const wordRange = options.wordRange || "520-700";
-  const sourceLines = packet.selectedSources
-    .slice(0, maxSources)
-    .map((source, index) => {
-      const title = cleanupSourceTitle(source.title);
-      const evidence = trimText(extractEvidenceText(source), evidenceChars);
-      return `[${index + 1}] ${title}: ${evidence}`;
-    })
-    .join("\n");
-
-  return `${buildModeSystemPrompt(packet)}
-
-Topic: ${trimText(research.brief, briefChars)}
-
-Editorial angle:
-${packet.editorialAngle}
-
-Research notes:
-${sourceLines || "No sources collected."}
-
-Structure:
-${packet.sections.slice(0, sectionLimit).join(" | ")}
-
-Task:
-- First identify the single strongest through-line across the research notes.
-- Then write one newsletter in ${wordRange}.
-- Use original prose, not source wording.
-- Keep the body free of raw URLs.
-- Avoid repeated sentence patterns.
-- Cite sources inline as [1], [2].
-- Use markdown only: # title, opening paragraph, ## sections, and ## Sources at the end.
-- Write only the newsletter markdown.`;
-}
-
-function buildPromptVariants(research, packet, isRetry) {
-  const variants = [];
-  if (!isRetry) {
-    variants.push({
-      label: "full",
-      promptText: buildNewsletterPrompt(research, packet, {
-        sourceLimit: 4,
-        evidenceChars: 135,
-        briefChars: 180,
-        sectionLimit: 3,
-        wordRange: "520-700",
-      }),
-    });
-  }
-
-  variants.push({
-    label: "compact",
-    promptText: buildNewsletterPrompt(research, packet, {
-      sourceLimit: 3,
-      evidenceChars: 95,
-      briefChars: 150,
-      sectionLimit: 3,
-      wordRange: "480-640",
-    }),
-  });
-  variants.push({
-    label: "minimal",
-    promptText: buildMinimalPrompt(research, packet),
+    closeList();
+    html.push(`<p>${formatInlineMarkdown(stripped)}</p>`);
   });
 
-  return variants;
+  closeList();
+  return html.join("\n");
 }
 
-async function preparePromptInputs(aiSession, promptText) {
-  const messages = [
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: promptText,
-        },
-      ],
-    },
-  ];
-  const prompt = aiSession.processor.apply_chat_template(messages, {
-    add_generation_prompt: true,
-  });
-  const inputs = await aiSession.processor(prompt, null, null, {
-    add_special_tokens: false,
-  });
-  return {
-    prompt,
-    inputs,
-    inputLength: inputs.input_ids?.dims?.at(-1) || 0,
-  };
+function formatInlineMarkdown(text) {
+  let value = escapeHtml(text);
+  value = value.replace(/`([^`]+)`/g, "<code>$1</code>");
+  value = value.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  value = value.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  return value;
 }
 
-
-function calculateBrowserProfile(config) {
-  const maxSlices = Math.max(1, Number(config.maxSlices || 1));
-  const supportsSlicing = Boolean(config.supportsSlicing && maxSlices > 1);
-  const hostAvailableMemory = Number(config.hostAvailableMemory || 0);
-
-  if (!supportsSlicing) {
-    return {
-      sliceCount: 1,
-      percentage: 100,
-      label: "Single bundle",
-      maxNewTokens: config.hasWebGPU ? 1200 : 900,
-      maxInputTokens: config.hasWebGPU ? 1400 : 900,
-      reasoningMaxNewTokens: 220,
-      reasoningTimeoutMs: config.hasWebGPU ? 90000 : 75000,
-      generationTimeoutMs: config.hasWebGPU ? 300000 : 240000,
-      temperature: 0.55,
-    };
-  }
-
-  let sliceCount = 1;
-  if (!config.hasWebGPU) {
-    sliceCount = 1;
-  } else if (hostAvailableMemory > 0 && hostAvailableMemory < 3.5) {
-    sliceCount = 1;
-  } else if (config.isMobile) {
-    sliceCount = config.deviceMemory >= 12 ? 2 : 1;
-  } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 16) {
-    sliceCount = Math.min(maxSlices, 4);
-  } else if (config.deviceMemory >= 16 || config.hardwareConcurrency >= 12) {
-    sliceCount = Math.min(maxSlices, 3);
-  } else if (config.deviceMemory > 8 || config.hardwareConcurrency > 8) {
-    sliceCount = Math.min(maxSlices, 2);
-  }
-
-  const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 820;
-  if (percentage >= 50) {
-    maxNewTokens = 1100;
-  } else if (percentage >= 25) {
-    maxNewTokens = 920;
-  }
-
-  return {
-    sliceCount,
-    percentage,
-    label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
-    maxNewTokens,
-    maxInputTokens: percentage >= 50 ? 1320 : percentage >= 25 ? 1080 : 860,
-    reasoningMaxNewTokens: 220,
-    reasoningTimeoutMs: percentage >= 50 ? 100000 : 80000,
-    generationTimeoutMs: percentage >= 50 ? 240000 : 230000,
-    temperature: 0.65,
-  };
-}
-
-function buildBrowserCandidates(browserConfig, recommendedProfile, deviceConfig) {
-  if (!browserConfig?.local_model_ready || !browserConfig?.local_model_id) {
-    return [];
-  }
-
-  const supportsSlicing = Boolean(browserConfig.supports_slicing && browserConfig.max_slices > 1);
-  const candidates = [];
-  const preferredSlices = supportsSlicing
-    ? buildSliceFallbackChain(recommendedProfile.sliceCount, Number(browserConfig.max_slices || 1))
-    : [1];
-
-  if (deviceConfig.hasWebGPU) {
-    preferredSlices.forEach((sliceCount) => {
-      candidates.push(buildBrowserCandidate(browserConfig, "webgpu", sliceCount, recommendedProfile));
-    });
-  }
-
-  const wasmSlices = supportsSlicing
-    ? buildSliceFallbackChain(Math.min(recommendedProfile.sliceCount, 2), Number(browserConfig.max_slices || 1))
-    : [1];
-  wasmSlices.forEach((sliceCount) => {
-    candidates.push(buildBrowserCandidate(browserConfig, "wasm", sliceCount, recommendedProfile));
-  });
-
-  return dedupeCandidates(candidates);
-}
-
-function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedProfile) {
-  const supportsSlicing = Boolean(browserConfig.supports_slicing && browserConfig.max_slices > 1);
-  const normalizedSliceCount = Math.max(1, sliceCount || 1);
-  const maxSlices = Math.max(1, Number(browserConfig.max_slices || 1));
-  const percentage = Math.round((normalizedSliceCount / maxSlices) * 100);
-  const sliceLabel = supportsSlicing
-    ? `${percentage}% slice (${normalizedSliceCount}/${maxSlices})`
-    : "Single bundle";
-  const maxNewTokens = device === "webgpu"
-    ? Math.max(800, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 40)
-    : Math.max(800, recommendedProfile.maxNewTokens);
-  const maxInputTokens = device === "webgpu"
-    ? Math.max(850, recommendedProfile.maxInputTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 120)
-    : Math.min(900, recommendedProfile.maxInputTokens);
-  const modelOptions = { device };
-
-  if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {
-    modelOptions.dtype = browserConfig.dtype_map;
-  }
-
-  if (supportsSlicing) {
-    modelOptions.model_kwargs = { num_slices: normalizedSliceCount };
-  }
-
-  return {
-    device,
-    model: browserConfig.local_model_id,
-    label: `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}`,
-    sliceCount: normalizedSliceCount,
-    sliceLabel,
-    percentage,
-    maxNewTokens,
-    maxInputTokens,
-    generationTimeoutMs: device === "webgpu"
-      ? Math.max(70000, recommendedProfile.generationTimeoutMs - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 10000)
-      : Math.min(70000, recommendedProfile.generationTimeoutMs),
-    temperature: recommendedProfile.temperature,
-    modelOptions,
-  };
-}
-
-function buildSliceFallbackChain(targetSlices, maxSlices) {
-  const chain = [];
-  const normalizedTarget = Math.max(1, Math.min(targetSlices || 1, maxSlices || 1));
-  [normalizedTarget, Math.ceil(normalizedTarget * 0.75), Math.ceil(normalizedTarget * 0.5), 2, 1]
-    .forEach((value) => {
-      const sliceCount = Math.max(1, Math.min(value, maxSlices));
-      if (!chain.includes(sliceCount)) {
-        chain.push(sliceCount);
-      }
-    });
-  return chain;
-}
-
-function dedupeCandidates(candidates) {
-  const seen = new Set();
-  return candidates.filter((candidate) => {
-    const key = `${candidate.device}:${candidate.model}:${candidate.sliceCount}`;
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function reportClientError(context, error) {
-  try {
-    fetch("/api/client-error", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        context,
-        message: error?.message || String(error),
-        stack: error?.stack || "",
-      }),
-    }).catch(() => {});
-  } catch (_) {}
-}
-
-async function fetchJSON(url, options = {}) {
-  const response = await fetch(url, options);
-  let data = {};
-  try {
-    data = await response.json();
-  } catch (error) {
-    data = {};
-  }
-  if (!response.ok) {
-    throw new Error(data.error || `Request failed: ${response.status}`);
-  }
-  return data;
-}
-
-function withTimeout(promise, timeoutMs, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      window.setTimeout(() => reject(new Error(message)), timeoutMs);
-    }),
-  ]);
+function stripSourcesSection(markdown) {
+  return String(markdown || "").replace(/\n##\s+Sources[\s\S]*$/i, "").trim();
 }
 
 function stripMarkdownFences(text) {
@@ -1450,15 +2480,207 @@ function stripMarkdownFences(text) {
 }
 
 function extractTitleFromMarkdown(markdown, fallbackTitle) {
-  const match = markdown.match(/^#\s+(.+)$/m);
-  return match ? match[1].trim() : fallbackTitle;
+  const match = String(markdown || "").match(/^#\s+(.+)$/m);
+  return match ? cleanText(match[1]) : fallbackTitle;
+}
+
+function extractPlainText(markdown) {
+  return cleanText(
+    stripMarkdownFences(markdown)
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/\n+/g, " "),
+  );
+}
+
+function parseJsonBlock(text) {
+  const cleaned = stripMarkdownFences(text).trim();
+  const startIndex = cleaned.indexOf("{");
+  const endIndex = cleaned.lastIndexOf("}");
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    throw new Error("Chronicle did not return a JSON object.");
+  }
+
+  const jsonText = cleaned.slice(startIndex, endIndex + 1);
+  return JSON.parse(jsonText);
+}
+
+function extractSnippetFromDescription(descriptionHtml, title) {
+  if (!descriptionHtml) {
+    return "";
+  }
+
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = descriptionHtml;
+  const snippet = cleanText(wrapper.textContent || "");
+  if (!snippet || looksTooCloseToHeadline(snippet, title)) {
+    return "";
+  }
+  return snippet;
+}
+
+function uniqueStrings(values) {
+  const seen = new Set();
+  return values
+    .map((value) => cleanText(value))
+    .filter((value) => {
+      if (!value) {
+        return false;
+      }
+      const key = value.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function cleanText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function trimText(text, maximumLength) {
-  if (text.length <= maximumLength) {
-    return text;
+  const value = String(text || "");
+  if (value.length <= maximumLength) {
+    return value;
   }
-  return `${text.slice(0, maximumLength - 1).trim()}…`;
+  return `${value.slice(0, maximumLength - 1).trim()}…`;
+}
+
+function cleanTitle(value) {
+  const text = cleanText(value)
+    .replace(/^topic\s*:\s*/i, "")
+    .replace(/[.]+$/g, "");
+  if (!text) {
+    return "Chronicle Issue";
+  }
+  return text
+    .split(/\s+/)
+    .slice(0, 8)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function cleanSearchQuery(value) {
+  return cleanText(value)
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.]+$/g, "");
+}
+
+function fillMissingQueries(existingQueries, brief, queryCount) {
+  const topic = cleanSearchQuery(brief);
+  const keywords = topic
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 2)
+    .slice(0, 6);
+  const keywordStem = keywords.join(" ");
+  const fallbackPool = [
+    `${topic} latest news`,
+    `${topic} this week`,
+    `${topic} latest developments`,
+    `${topic} analysis`,
+    `${topic} outlook`,
+    keywordStem ? `${keywordStem} policy economy` : "",
+    keywordStem ? `${keywordStem} Reuters OR AP OR Bloomberg` : "",
+    keywordStem ? `${keywordStem} government business technology` : "",
+  ].map((query) => cleanSearchQuery(query));
+
+  const merged = uniqueStrings([...existingQueries, ...fallbackPool]).slice(0, queryCount);
+  while (merged.length < queryCount) {
+    merged.push(`${topic} update ${merged.length + 1}`);
+  }
+  return merged;
+}
+
+function resolveInputLength(inputIds) {
+  if (!inputIds) {
+    return 0;
+  }
+  if (typeof inputIds.dims?.at === "function") {
+    return inputIds.dims.at(-1) || 0;
+  }
+  if (Array.isArray(inputIds)) {
+    if (Array.isArray(inputIds[0])) {
+      return inputIds[0].length || 0;
+    }
+    return inputIds.length || 0;
+  }
+  return 0;
+}
+
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "chronicle-issue";
+}
+
+function normalizeForComparison(value) {
+  return cleanText(value)
+    .toLowerCase()
+    .replace(/\b(reuters|bbc|cnbc|fortune|economic times|the economic times|ap|bloomberg|cnn|techcrunch|dw\.com|dw|nytimes|the new york times)\b/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksTooCloseToHeadline(candidate, title) {
+  const left = normalizeForComparison(candidate);
+  const right = normalizeForComparison(title);
+  if (!left || !right) {
+    return false;
+  }
+  if (left === right) {
+    return true;
+  }
+  return left.length >= right.length * 0.75 && (left.includes(right) || right.includes(left));
+}
+
+function summarizeHeadlineSignal(title, query) {
+  const normalized = normalizeForComparison(title);
+  const keywords = uniqueStrings(normalized.split(/\s+/)).slice(0, 6);
+  if (keywords.length) {
+    return trimText(keywords.join(" "), 72);
+  }
+  return trimText(cleanSearchQuery(query), 72);
+}
+
+function distillSummary(summary, sourceTitle) {
+  let text = cleanText(summary);
+  if (looksTooCloseToHeadline(text, sourceTitle)) {
+    text = `This source indicates a material development connected to ${extractOutletName(sourceTitle)}'s reporting.`;
+  }
+  return trimSentence(text);
+}
+
+function trimSentence(text) {
+  const value = cleanText(text).replace(/\s+/g, " ");
+  if (!value) {
+    return "";
+  }
+  return /[.!?]$/.test(value) ? value : `${value}.`;
+}
+
+function basename(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  const parts = text.split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+function runtimeLabelForSession(session) {
+  return session.profile?.device === "webgpu" ? "WebGPU" : "WASM";
+}
+
+function clampNumber(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, Number(value) || 0));
 }
 
 function escapeHtml(value) {
@@ -1470,6 +2692,53 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function aiTokenBudget(run, fallback) {
+  return Math.min(fallback, state.browserSession?.profile?.maxNewTokens || state.browserProfile?.maxNewTokens || fallback);
+}
+
+function aiTimeoutBudget(run, fallback) {
+  void run;
+  return Math.min(fallback, state.browserSession?.profile?.generationTimeoutMs || state.browserProfile?.generationTimeoutMs || fallback);
+}
+
+function writerTimeoutBudget(run, fallback) {
+  const remainingMs = Math.max(5000, (run.writeDeadlineAt || Date.now()) - Date.now());
+  return Math.min(
+    aiTimeoutBudget(run, fallback),
+    remainingMs,
+  );
+}
+
+function ensureWriterDeadline(run, stepName) {
+  if (!run.writeDeadlineAt) {
+    return;
+  }
+  if (Date.now() > run.writeDeadlineAt) {
+    throw new Error(`Chronicle timed out during ${stepName}. Please retry with fewer results or lower depth.`);
+  }
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]);
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => {
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => resolve());
+      return;
+    }
+    window.setTimeout(resolve, 0);
+  });
 }
