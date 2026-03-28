@@ -1006,18 +1006,6 @@ def run_newsletter_pipeline(
                 print("  Skipped source: no article text or search snippet available")
                 continue
 
-            try:
-                source_digest = summarize_source(
-                    brief,
-                    plan,
-                    result,
-                    source_text,
-                    settings["summary_tokens"],
-                )
-            except Exception as exc:
-                print(f"  Skipped source: summary failed: {exc}")
-                continue
-
             source_record = {
                 "query": query,
                 "rank_index": rank,
@@ -1025,56 +1013,27 @@ def run_newsletter_pipeline(
                 "url": result["url"],
                 "snippet": result["snippet"],
                 "article_text": article_text,
-                "source_summary": source_digest["summary"],
-                "relevance_score": float(source_digest["relevance"]),
+                "source_summary": "",
+                "relevance_score": 0.0,
             }
             save_source(run_id, source_record)
-            collected_sources.append(
-                {
-                    "query": query,
-                    "rank_index": rank,
-                    "title": result["title"],
-                    "url": result["url"],
-                    "snippet": result["snippet"],
-                    "source_summary": source_digest["summary"],
-                    "relevance_score": float(source_digest["relevance"]),
-                }
-            )
-            del article_text
-            del source_text
-            del source_record
+            collected_sources.append(source_record)
             print(f"  Saved source: {result['title']}")
 
         if research_budget_hit:
             break
 
-    if not collected_sources:
-        print(
-            "\nNo usable sources were collected from the web search step. "
-            "Falling back to a source-free draft."
-        )
-        newsletter_markdown = compose_fallback_newsletter(
-            brief,
-            plan,
-            days,
-            market_snapshot,
-            depth,
-            explanation_style,
-            custom_style_instructions,
-            settings["newsletter_tokens"],
-        )
-    else:
-        newsletter_markdown = compose_newsletter(
-            brief,
-            plan,
-            collected_sources,
-            days,
-            market_snapshot,
-            depth,
-            explanation_style,
-            custom_style_instructions,
-            settings["newsletter_tokens"],
-        )
+    newsletter_markdown = compose_newsletter(
+        brief,
+        plan,
+        collected_sources,
+        days,
+        market_snapshot,
+        depth,
+        explanation_style,
+        custom_style_instructions,
+        settings["newsletter_tokens"],
+    )
     output_files = write_newsletter_files(output_dir, plan["title"], newsletter_markdown)
     update_run_output_path(run_id, output_files["html_path"])
 
@@ -1138,61 +1097,7 @@ def build_explanation_guidance(explanation_style, custom_style_instructions):
 
 
 def build_research_plan(brief, days, query_limit, depth):
-    prompt = f"""<start_of_turn>user
-You are the planning brain for a newsletter agent.
-
-Task:
-- understand the brief
-- decide what web searches are needed
-- decide what sections the newsletter should have
-- produce a plan for a newsletter covering the last {days} days
-- adjust the breadth of research for {depth} depth
-
-Brief:
-"{brief}"
-
-Return ONLY JSON in this format:
-{{"title":"str","audience":"str","tone":"str","queries":["q1","q2"],"sections":["s1","s2","s3"]}}
-
-Rules:
-- choose exactly {query_limit} focused search queries
-- make the sections useful for a real newsletter
-- keep title concise
-- for low depth, keep the scope tight
-- for medium depth, balance breadth and efficiency
-- for high depth, cover the topic more comprehensively
-- do not include any text outside JSON
-<end_of_turn>
-<start_of_turn>model
-{{"title":"""
-
-    try:
-        plan = generate_json_from_prompt(
-            prompt,
-            '{"title":',
-            220,
-            schema_hint='{"title":"str","audience":"str","tone":"str","queries":["q1","q2"],"sections":["s1","s2","s3"]}',
-        )
-    except Exception as exc:
-        print(f"Planning fallback activated: {exc}")
-        return build_fallback_research_plan(brief, days, query_limit, depth)
-
-    queries = [str(item).strip() for item in plan.get("queries", []) if str(item).strip()]
-    sections = [str(item).strip() for item in plan.get("sections", []) if str(item).strip()]
-    if len(queries) < query_limit:
-        print("Planning fallback activated: model did not provide enough queries")
-        return build_fallback_research_plan(brief, days, query_limit, depth)
-    if not sections:
-        print("Planning fallback activated: model did not provide newsletter sections")
-        return build_fallback_research_plan(brief, days, query_limit, depth)
-
-    return {
-        "title": str(plan.get("title", "")).strip() or "Weekly Newsletter",
-        "audience": str(plan.get("audience", "")).strip() or "General readers",
-        "tone": str(plan.get("tone", "")).strip() or DEFAULT_WRITING_STYLE,
-        "queries": queries[:query_limit],
-        "sections": sections,
-    }
+    return build_fallback_research_plan(brief, days, query_limit, depth)
 
 
 def build_fallback_research_plan(brief, days, query_limit, depth):
@@ -1610,24 +1515,23 @@ def fetch_article_text(url, max_article_chars):
     text = clean_text(text)
     if looks_like_placeholder_article_text(text):
         return ""
-    return text[:max_article_chars]
+    return compact_evidence_text(text, max_article_chars)
 
 
 def build_source_text(result, article_text):
-    if article_text:
-        return article_text
-
     title = clean_text(result.get("title", ""))
     snippet = clean_text(result.get("snippet", ""))
-    normalized_title = re.sub(
-        r"\b(reuters|ap news|associated press|msn|aol\.com|yahoo!?\s*news|dw\.com|the new york times|al jazeera|national post|toronto star|britannica)\b",
-        " ",
-        title.lower(),
-    )
-    normalized_title = clean_text(re.sub(r"[^a-z0-9]+", " ", normalized_title))
-    normalized_snippet = clean_text(re.sub(r"[^a-z0-9]+", " ", snippet.lower()))
-    if snippet and normalized_snippet and normalized_snippet != normalized_title:
-        return clean_text(f"{title}. {snippet}")
+    compact_article = compact_evidence_text(article_text, 360)
+    if compact_article:
+        return compact_article
+
+    compact_snippet = compact_evidence_text(snippet, 220)
+    if compact_snippet:
+        normalized_title = normalize_source_phrase(title)
+        normalized_snippet = normalize_source_phrase(compact_snippet)
+        if normalized_snippet and normalized_snippet != normalized_title:
+            return compact_snippet
+
     return title
 
 
@@ -1640,57 +1544,66 @@ def looks_like_placeholder_article_text(text):
     return len(normalized) < 120
 
 
-def summarize_source(brief, plan, result, article_text, summary_tokens):
-    prompt = f"""<start_of_turn>user
-You are summarizing one web source for a newsletter writer.
-
-Newsletter brief:
-"{brief}"
-
-Planned audience:
-"{plan['audience']}"
-
-Planned sections:
-{json.dumps(plan['sections'])}
-
-Source title:
-"{result['title']}"
-
-Source URL:
-"{result['url']}"
-
-Source text:
-\"\"\"
-{article_text}
-\"\"\"
-
-Return ONLY JSON in this format:
-{{"summary":"str","relevance":0.0,"key_points":["p1","p2","p3"]}}
-
-Rules:
-- keep summary factual and concise
-- relevance must be between 0 and 1
-- focus on information useful for the newsletter brief
-- do not include any text outside JSON
-<end_of_turn>
-<start_of_turn>model
-{{"summary":"""
-
-    data = generate_json_from_prompt(
-        prompt,
-        '{"summary":',
-        summary_tokens,
-        schema_hint='{"summary":"str","relevance":0.0,"key_points":["p1","p2","p3"]}',
+def build_mode_system_prompt(explanation_style, custom_style_instructions):
+    """Return a compact, mode-specific system prompt."""
+    base = (
+        "You are Chronicle, a newsletter writer. "
+        "Think silently, form one strong argument from the research notes, and write clean markdown. "
+        "Do not copy source wording. Do not use raw URLs in the body. Do not repeat sentences."
     )
-    summary = str(data.get("summary", "")).strip()
-    if not summary:
-        raise ValueError("Empty source summary")
 
-    return {
-        "summary": summary,
-        "relevance": float(data.get("relevance", 0) or 0),
-        "key_points": data.get("key_points", []),
-    }
+    if explanation_style == "feynman":
+        return (
+            f"{base}\n\n"
+            "WRITING MODE — Feynman:\n"
+            "Explain every idea as if teaching an intelligent beginner. "
+            "Use plain language, clear causality, and concrete analogies. "
+            "Break down jargon without being condescending. "
+            "Make complexity feel intuitive."
+        )
+
+    if explanation_style == "soc":
+        return (
+            f"{base}\n\n"
+            "WRITING MODE — Socratic:\n"
+            "Structure the newsletter around questions and answers. "
+            "Open each section with a sharp question, then answer it with evidence. "
+            "Let each answer deepen the reader's understanding and lead naturally to the next question. "
+            "Keep it conversational and intellectually honest."
+        )
+
+    if explanation_style == "custom" and custom_style_instructions:
+        return (
+            f"{base}\n\n"
+            f"WRITING MODE — Custom:\n"
+            f"Follow these instructions exactly: {custom_style_instructions}"
+        )
+
+    # Default: concise
+    return (
+        f"{base}\n\n"
+        "WRITING MODE — Concise:\n"
+        "Be tight, selective, and high-signal. Short paragraphs. No filler. "
+        "Prefer strong interpretation over padded recap. "
+        "Every sentence should earn its place."
+    )
+
+
+def build_source_block(collected_sources):
+    """Format compact research notes for the model prompt."""
+    if not collected_sources:
+        return "No web sources were collected."
+
+    blocks = []
+    for index, source in enumerate(collected_sources[:4], start=1):
+        title = clean_text(source.get("title", ""))
+        evidence = build_source_text(source, source.get("article_text", ""))
+        evidence = compact_evidence_text(evidence, 240)
+        if not evidence:
+            evidence = title
+        blocks.append(f"[{index}] {title}: {evidence}")
+
+    return "\n\n".join(blocks)
 
 
 def compose_newsletter(
@@ -1704,101 +1617,47 @@ def compose_newsletter(
     custom_style_instructions,
     newsletter_tokens,
 ):
-    compact_sources = []
-    for index, source in enumerate(collected_sources, start=1):
-        compact_sources.append(
-            {
-                "id": index,
-                "title": source["title"],
-                "url": source["url"],
-                "summary": source["source_summary"],
-                "relevance": source["relevance_score"],
-            }
+    system_prompt = build_mode_system_prompt(explanation_style, custom_style_instructions)
+    source_block = build_source_block(collected_sources)
+    market_block = json.dumps(market_snapshot, ensure_ascii=True) if market_snapshot else "None."
+    sections_block = " | ".join(plan["sections"][:3])
+    no_sources_note = ""
+    if not collected_sources:
+        no_sources_note = (
+            "\nIMPORTANT: No web sources were collected. "
+            "Write the newsletter based only on the brief and any market data. "
+            "Be explicit about what is unverified. Do not invent events, quotes, or citations."
         )
 
-    market_data_block = json.dumps(market_snapshot, ensure_ascii=True)
-    explanation_guidance = build_explanation_guidance(
-        explanation_style,
-        custom_style_instructions,
-    )
-    editorial_brief = build_editorial_brief(
-        brief,
-        plan,
-        compact_sources,
-        market_snapshot,
-        depth,
-    )
-
     prompt = f"""<start_of_turn>user
-You are the writing brain for a newsletter agent.
+{system_prompt}
 
-Write a complete markdown newsletter using the structured market data, editorial brief, and source summaries provided.
+Topic: {clean_text(brief)[:180]}
+Title: {clean_text(plan['title'])[:100]}
+Audience: {clean_text(plan['audience'])[:80]}
+Coverage window: last {days} days
+Depth: {depth}
+Section plan: {sections_block}
 
-Newsletter brief:
-"{brief}"
+Research notes:
+{source_block}
 
-Title:
-"{plan['title']}"
+Market data:
+{market_block}
+{no_sources_note}
 
-Audience:
-"{plan['audience']}"
-
-Tone:
-"{plan['tone']}"
-
-House style:
-"{DEFAULT_WRITING_STYLE}"
-
-Explanation style:
-{explanation_style}
-
-Explanation guidance:
-"{explanation_guidance}"
-
-Coverage window:
-Last {days} days
-
-Research depth:
-{depth}
-
-Planned sections:
-{json.dumps(plan['sections'])}
-
-Editorial brief:
-{json.dumps(editorial_brief, ensure_ascii=True)}
-
-Structured market data:
-{market_data_block}
-
-Source summaries:
-{json.dumps(compact_sources, ensure_ascii=True)}
-
-Requirements:
-- write a strong headline
-- aim for roughly 550 to 800 words
-- include a short opening note with a point of view
-- organize the body around the planned sections
-- make it readable, analytical, and confident
-- do not sound generic, padded, or corporate
-- do not merely aggregate events; synthesize them into a sharp argument
-- prove the thesis aggressively instead of hinting at it
-- surface the hidden pattern the average reader would miss
-- make at least one concrete interpretation about what mattered most this week
-- include one killer insight that makes the reader rethink the topic
-- prefer sharp-smart over safe-smart
-- avoid consultant language, hedging, and empty acceleration talk
-- follow the explanation guidance exactly
-- if depth is low, keep it crisp and selective
-- if depth is medium, balance signal and concision
-- if depth is high, go deeper on implications and cross-source synthesis
-- use inline citations like [1], [2]
-- if structured market data is present, cite it as [M1]
-- if structured market data is provided, use the exact percentage moves and prices from it instead of vague descriptions
-- when you mention top market movers, include the actual numbers such as 24h or 7d percentage moves
-- end with a short closing note
-- include a final Sources section listing [id]: title - url
-- if structured market data is present, add: [M1]: CoinGecko Markets API - https://www.coingecko.com/
-- return markdown only
+Instructions:
+- First identify the strongest through-line across the research notes
+- Then write 550 to 750 words
+- Start with one H1 title and a sharp opening paragraph
+- Use H2 headings for the main sections
+- Synthesize the evidence into a coherent argument, not a list of summaries
+- Explain why the developments matter, not just what happened
+- Cite sources inline as [1], [2] etc.
+- If market data exists, cite as [M1] and use the actual numbers
+- End with a ## Sources section: [1]: Title - URL format
+- If market data was cited, add: [M1]: CoinGecko Markets API - https://www.coingecko.com/
+- Write only the markdown newsletter, nothing else
 <end_of_turn>
 <start_of_turn>model
 """
@@ -1806,139 +1665,56 @@ Requirements:
     return generate_text_from_prompt(prompt, newsletter_tokens).strip()
 
 
-def compose_fallback_newsletter(
-    brief,
-    plan,
-    days,
-    market_snapshot,
-    depth,
-    explanation_style,
-    custom_style_instructions,
-    newsletter_tokens,
-):
-    explanation_guidance = build_explanation_guidance(
-        explanation_style,
-        custom_style_instructions,
+def normalize_source_phrase(value):
+    normalized = re.sub(
+        r"\b(reuters|ap news|associated press|msn|aol\.com|yahoo!?\s*news|dw\.com|the new york times|al jazeera|national post|toronto star|britannica)\b",
+        " ",
+        str(value or "").lower(),
     )
-    prompt = f"""<start_of_turn>user
-You are the writing brain for a newsletter agent.
-
-Write a markdown newsletter draft even though no web sources were successfully collected.
-
-Newsletter brief:
-"{brief}"
-
-Title:
-"{plan['title']}"
-
-Audience:
-"{plan['audience']}"
-
-Tone:
-"{plan['tone']}"
-
-House style:
-"{DEFAULT_WRITING_STYLE}"
-
-Explanation style:
-{explanation_style}
-
-Explanation guidance:
-"{explanation_guidance}"
-
-Coverage window:
-Last {days} days
-
-Research depth:
-{depth}
-
-Planned sections:
-{json.dumps(plan['sections'])}
-
-Structured market data:
-{json.dumps(market_snapshot, ensure_ascii=True)}
-
-Requirements:
-- begin with a bold note that live web source collection failed
-- keep the draft within roughly 450 to 700 words
-- state clearly that the draft is based on the brief, plan, and any structured market data only
-- do not invent recent events, dates, quotes, numbers, or citations from external reporting
-- if structured market data is present, you may reference it and cite it as [M1]
-- if there is not enough verified information, explicitly say what is unknown
-- organize the body around the planned sections
-- keep the writing useful, analytical, and honest about uncertainty
-- end with a short next-steps note
-- include a final Sources section
-- if structured market data is present, list only: [M1]: CoinGecko Markets API - https://www.coingecko.com/
-- if no structured market data is present, say in Sources that no external sources were successfully collected
-- return markdown only
-<end_of_turn>
-<start_of_turn>model
-"""
-
-    return generate_text_from_prompt(prompt, newsletter_tokens).strip()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return clean_text(normalized)
 
 
-def build_editorial_brief(brief, plan, compact_sources, market_snapshot, depth):
-    prompt = f"""<start_of_turn>user
-You are the editorial strategist for a premium newsletter.
+def compact_evidence_text(text, max_chars):
+    value = clean_text(text or "")
+    if not value:
+        return ""
 
-Your job is to transform raw source summaries into a sharp point of view before drafting begins.
+    value = re.sub(r"\b(title|url|evidence)\s*:\s*", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"https?://\S+", " ", value, flags=re.IGNORECASE)
+    value = clean_text(value)
+    if not value:
+        return ""
 
-Newsletter brief:
-"{brief}"
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    selected = []
+    seen = set()
+    total_length = 0
+    for sentence in sentences:
+        cleaned_sentence = clean_text(sentence)
+        if len(cleaned_sentence) < 25:
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", cleaned_sentence.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(cleaned_sentence)
+        total_length += len(cleaned_sentence) + 1
+        if total_length >= max_chars:
+            break
 
-Audience:
-"{plan['audience']}"
+    if not selected:
+        fallback = value[:max_chars].rsplit(" ", 1)[0].strip()
+        return fallback or value[:max_chars].strip()
 
-Tone:
-"{plan['tone']}"
+    compact = clean_text(" ".join(selected))
+    if len(compact) <= max_chars:
+        return compact
 
-Depth:
-{depth}
+    trimmed = compact[:max_chars].rsplit(" ", 1)[0].strip()
+    return trimmed or compact[:max_chars].strip()
 
-Planned sections:
-{json.dumps(plan['sections'])}
 
-Structured market data:
-{json.dumps(market_snapshot, ensure_ascii=True)}
-
-Source summaries:
-{json.dumps(compact_sources, ensure_ascii=True)}
-
-Return ONLY JSON in this format:
-{{"core_thesis":"str","hidden_pattern":"str","killer_insight":"str","contrarian_take":"str","proof_points":["p1","p2","p3"]}}
-
-Rules:
-- the thesis must be explicit and defensible
-- the hidden pattern must go beyond restating events
-- the killer insight should feel memorable and surprising
-- the contrarian take should sharpen the voice without becoming fake or sensational
-- proof_points should be concrete claims the final newsletter should prove
-- do not include any text outside JSON
-<end_of_turn>
-<start_of_turn>model
-{{"core_thesis":"""
-
-    try:
-        return generate_json_from_prompt(
-            prompt,
-            '{"core_thesis":',
-            220,
-            schema_hint='{"core_thesis":"str","hidden_pattern":"str","killer_insight":"str","contrarian_take":"str","proof_points":["p1","p2","p3"]}',
-        )
-    except Exception:
-        return {
-            "core_thesis": "This week was not just busy; it showed a clearer strategic direction in the field.",
-            "hidden_pattern": "Parallel progress across multiple fronts usually matters more than any single headline.",
-            "killer_insight": "When separate parts of an industry start solving adjacent bottlenecks at once, the story shifts from isolated progress to ecosystem readiness.",
-            "contrarian_take": "The real signal is not hype volume but whether different constraints are easing at the same time.",
-            "proof_points": [
-                "Multiple sources point to simultaneous progress rather than one-off noise.",
-                "The most important development is the change in system-level readiness.",
-                "Readers should come away with a sharper frame, not just a recap.",
-            ],
-        }
 
 
 def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):

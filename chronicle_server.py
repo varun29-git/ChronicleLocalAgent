@@ -87,6 +87,20 @@ class ChronicleHandler(BaseHTTPRequestHandler):
 
             return self.send_json({"job": job}, status=HTTPStatus.ACCEPTED)
 
+        if parsed.path == "/api/client-error":
+            payload = self.read_json_body()
+            if payload:
+                ctx = payload.get("context", "unknown")
+                msg = payload.get("message", "")
+                stack = payload.get("stack", "")
+                print(f"\n{'='*60}")
+                print(f"[BROWSER ERROR] context={ctx}")
+                print(f"  message: {msg}")
+                if stack:
+                    print(f"  stack: {stack[:500]}")
+                print(f"{'='*60}\n")
+            return self.send_json({"ok": True})
+
         if parsed.path == "/api/research":
             payload = self.read_json_body()
             if payload is None:

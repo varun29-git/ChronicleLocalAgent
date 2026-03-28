@@ -270,30 +270,53 @@ async function runBrowserGeneration(payload) {
   updateTurnStatus("Sending to Chronicle brain");
 
   let markdown = "";
-  let usedFallbackDraft = false;
-
-  updateTurnStatus("Sending to Chronicle brain");
+  let usedServerFallback = false;
 
   try {
     const aiSession = await withTimeout(
       ensureBrowserSession(),
       20000,
-      "Browser model loading took too long. Using Chronicle's backup draft instead.",
+      "Browser model loading took too long.",
     );
     setStageState("brain", "complete");
     setStageState("generate", "active");
-    updateTurnStatus("Generating newsletter");
+    updateTurnStatus("Generating newsletter locally");
 
     const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
       void partialText;
     });
-    markdown = finalizeNewsletterMarkdown(stripMarkdownFences(generatedMarkdown), packet);
-  } catch (error) {
-    void error;
+    const cleaned = stripMarkdownFences(generatedMarkdown).trim();
+    if (cleaned.length < 200) {
+      throw new Error("Browser model produced too little output.");
+    }
+    markdown = finalizeNewsletterMarkdown(cleaned, packet);
+  } catch (browserError) {
+    console.error("[Chronicle] Browser generation FAILED:", browserError?.message || browserError);
+    reportClientError("browser_generation", browserError);
     setStageState("brain", "complete");
     setStageState("generate", "active");
-    usedFallbackDraft = true;
-    markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
+    updateTurnStatus("Retrying with simpler prompt");
+
+    try {
+      const aiSession = state.browserSession;
+      if (aiSession?.model) {
+        const retryMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, () => {}, true);
+        const retryCleaned = stripMarkdownFences(retryMarkdown).trim();
+        console.log("[Chronicle] Retry output length:", retryCleaned.length);
+        if (retryCleaned.length >= 150) {
+          markdown = finalizeNewsletterMarkdown(retryCleaned, packet);
+        } else {
+          throw new Error("Retry produced too little: " + retryCleaned.length + " chars");
+        }
+      } else {
+        throw new Error("No browser session available for retry");
+      }
+    } catch (retryError) {
+      console.error("[Chronicle] Retry ALSO FAILED:", retryError?.message || retryError);
+      reportClientError("browser_retry", retryError);
+      usedServerFallback = true;
+      markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
+    }
   }
 
   const normalizedMarkdown = finalizeNewsletterMarkdown(markdown, packet);
@@ -324,10 +347,33 @@ async function runBrowserGeneration(payload) {
   });
 
   setGenerateBusy(false);
-  setStageState("generate", "complete", usedFallbackDraft ? "Backup issue ready" : "Issue ready");
+  setStageState("generate", "complete", usedServerFallback ? "Backup issue ready" : "Issue ready");
   updateTurnStatus(`Issue ready: ${saveResponse.run.title}`);
   appendResultCard(saveResponse.run, normalizedMarkdown);
   await refreshStatus();
+}
+
+async function waitForServerJob(jobId) {
+  return new Promise((resolve, reject) => {
+    state.activeJobId = jobId;
+    stopPolling();
+    state.pollTimer = window.setInterval(async () => {
+      try {
+        const response = await fetchJSON(`/api/jobs/${jobId}`);
+        renderJobState(response.job);
+        if (response.job.status === "completed") {
+          stopPolling();
+          resolve(response.job);
+        } else if (response.job.status === "failed") {
+          stopPolling();
+          reject(new Error(response.job.error?.message || "Server generation failed."));
+        }
+      } catch (error) {
+        stopPolling();
+        reject(error);
+      }
+    }, 1500);
+  });
 }
 
 async function startServerGeneration(payload) {
@@ -518,38 +564,8 @@ function scrollThreadToBottom() {
   elements.chatThread.scrollTop = elements.chatThread.scrollHeight;
 }
 
-function buildResearchLogs(research) {
-  const logs = [
-    "Planning complete.",
-    `Title: ${research.plan?.title || "Untitled"}`,
-  ];
-  (research.plan?.queries || []).forEach((query) => {
-    logs.push(`Searching: ${query}`);
-  });
-  return logs;
-}
-
-function buildVisibleProcessLogs(research, packet) {
-  const directEvidenceCount = packet.selectedSources.filter((source) => !isIndirectSource(source)).length;
-  const headlineEvidenceCount = packet.selectedSources.length - directEvidenceCount;
-  return [
-    "Planning complete.",
-    `Research mode: ${research.depth}`,
-    `Requested writing mode: ${research.explanation_style}`,
-    `Coverage window: last ${research.days} day(s)`,
-    `Collecting sources across ${research.plan?.queries?.length || 0} Google search pass(es).`,
-    `Candidate sources collected: ${research.sources?.length || 0}`,
-    `Evidence packet built: ${packet.selectedSources.length} source(s) selected for Chronicle's brain.`,
-    directEvidenceCount
-      ? `Richer article evidence captured for ${directEvidenceCount} source(s).`
-      : "Most evidence is still headline-level, so Chronicle will reason conservatively.",
-    headlineEvidenceCount ? `Headline-only evidence remaining: ${headlineEvidenceCount} source(s).` : "",
-  ].filter(Boolean);
-}
-
 function buildEditorialPacket(research) {
   const selectedSources = selectTopSources(research.sources || [], research.depth === "high" ? 10 : 8);
-  const styleGuidance = buildStyleGuidance(research.explanation_style, research.style_instructions || "");
 
   return {
     brief: research.brief,
@@ -564,7 +580,6 @@ function buildEditorialPacket(research) {
     sections: research.plan?.sections || ["What happened", "Why it matters", "What to watch next"],
     marketSnapshot: research.market_snapshot || [],
     selectedSources,
-    styleGuidance,
   };
 }
 
@@ -629,67 +644,54 @@ function cleanupSourceTitle(title) {
     .trim();
 }
 
-function extractThemeTerms(sources, limit) {
-  const termScores = new Map();
-  const stopwords = new Set([
-    "about", "after", "amid", "analysis", "and", "are", "but", "from", "have", "into",
-    "latest", "news", "over", "says", "saying", "that", "the", "their", "this", "what",
-    "when", "where", "which", "will", "with", "would",
-  ]);
+function extractEvidenceText(source) {
+  const title = cleanupSourceTitle(source?.title || "");
+  const snippet = cleanEvidenceForPrompt(String(source?.snippet || "").trim(), title);
+  const article = cleanEvidenceForPrompt(String(source?.article_text || source?.source_text || "").trim(), title);
+  if (article) {
+    return trimText(article, 240);
+  }
+  if (snippet) {
+    return trimText(snippet, 180);
+  }
+  return title;
+}
 
-  sources.forEach((source) => {
-    const text = `${cleanupSourceTitle(source.title)} ${source.snippet || ""}`.toLowerCase();
-    const words = text.match(/[a-z][a-z0-9-]{2,}/g) || [];
-    const seenInSource = new Set();
-    words.forEach((word) => {
-      if (stopwords.has(word) || seenInSource.has(word)) {
-        return;
-      }
-      seenInSource.add(word);
-      termScores.set(word, (termScores.get(word) || 0) + 1);
-    });
+function cleanEvidenceForPrompt(text, title = "") {
+  let value = String(text || "")
+    .replace(/\b(title|url|evidence)\s*:\s*/gi, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\[[0-9]+\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!value) {
+    return "";
+  }
+
+  if (title) {
+    const escapedTitle = escapeRegExp(cleanupSourceTitle(title));
+    value = value.replace(new RegExp(`^${escapedTitle}[\\s:;,.\\-–—]+`, "i"), "").trim();
+  }
+
+  const sentences = value.match(/[^.!?]+[.!?]?/g) || [value];
+  const unique = [];
+  const seen = new Set();
+
+  sentences.forEach((sentence) => {
+    const cleanedSentence = String(sentence || "").replace(/\s+/g, " ").trim();
+    if (!cleanedSentence) {
+      return;
+    }
+    const key = cleanedSentence.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    unique.push(cleanedSentence);
   });
 
-  return [...termScores.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, limit)
-    .map(([term]) => term);
-}
-
-function buildWorkingThesis(research, selectedSources, themeTerms) {
-  if (!selectedSources.length) {
-    return `Chronicle has not verified enough reporting yet on "${research.brief}" and should draft carefully from the confirmed brief only.`;
-  }
-
-  if (themeTerms.length >= 2) {
-    return `The strongest verified signal in this brief is the overlap between ${themeTerms[0]} and ${themeTerms[1]}, not any single isolated headline.`;
-  }
-
-  return `The clearest verified pattern is that ${cleanupSourceTitle(selectedSources[0].title)} carries the lead signal for this briefing.`;
-}
-
-function buildCoverageGap(selectedSources) {
-  if (!selectedSources.length) {
-    return "No external reporting was verified, so the draft must stay explicit about uncertainty.";
-  }
-  if (selectedSources.every((source) => isIndirectSource(source))) {
-    return "Most evidence is coming from headline-level feeds, so the draft should stay conservative about details.";
-  }
-  return "Use the selected sources directly and avoid claims that are not grounded in the retrieved evidence.";
-}
-
-function buildReasoningSummary(packet, currentStage = "", editorialMemo = "") {
-  void editorialMemo;
-  return [
-    `Focus: ${packet.brief}`,
-    currentStage ? `Current stage: ${currentStage}` : "",
-    `Requested mode: ${packet.explanationStyle}`,
-    `Brain objective: use the source packet to form one clear argument and write the newsletter in that mode.`,
-    `Newsletter structure: ${packet.sections.join(" | ")}`,
-    `Reasoning note: ${buildVisibleReasoningNote(packet)}`,
-    `Evidence packet: ${packet.selectedSources.length} source(s) selected.`,
-    `Confidence note: ${buildCoverageGap(packet.selectedSources)}`,
-  ].filter(Boolean).join("\n");
+  return unique.join(" ").trim();
 }
 
 function finalizeNewsletterMarkdown(markdown, packet) {
@@ -707,269 +709,34 @@ function finalizeNewsletterMarkdown(markdown, packet) {
 }
 
 function renderFallbackNewsletter(packet) {
-  const openingSources = packet.selectedSources.slice(0, 2);
-  const bodySources = packet.selectedSources.slice(2, 5);
+  const sources = packet.selectedSources;
   const lines = [
     `# ${packet.title}`,
     "",
-    `Chronicle could not finish the full local writing pass, so this backup issue is built directly from the collected source packet for ${packet.brief}.`,
-    "",
-    openingSources.length
-      ? `The strongest visible signals came from ${openingSources.map((source, index) => `${cleanupSourceTitle(source.title)} [${index + 1}]`).join(" and ")}.`
-      : "The source packet was too thin to support a stronger opening claim.",
+    `Chronicle's local model could not complete the writing pass for this issue. Below is a structured summary built from the ${sources.length} source(s) collected for: ${packet.brief}.`,
     "",
   ];
 
-  packet.sections.forEach((sectionName, index) => {
-    lines.push(`## ${sectionName}`);
-    if (index === 0 && openingSources.length) {
-      lines.push(
-        `The clearest developments in the source packet point toward ${packet.brief} becoming the center of the story rather than just a passing mention in separate headlines.`
-      );
-    } else if (index === 1 && bodySources.length) {
-      lines.push(
-        `Taken together, the supporting sources suggest that the real value is not any single update, but the way several signals are clustering around the same narrative direction.`
-      );
-    } else {
-      lines.push(
-        `The next thing to watch is whether the same direction holds as new reporting arrives, because headline-level evidence can clarify or collapse quickly.`
-      );
-    }
+  if (sources.length) {
+    lines.push("## Key developments");
     lines.push("");
-  });
+    sources.slice(0, 5).forEach((source, index) => {
+      const title = cleanupSourceTitle(source.title);
+      const evidence = extractEvidenceText(source);
+      lines.push(`**${title}** [${index + 1}]`);
+      lines.push("");
+      lines.push(evidence);
+      lines.push("");
+    });
+  } else {
+    lines.push("## Note");
+    lines.push("");
+    lines.push("No web sources were collected for this brief. Try again with a different topic or check your internet connection.");
+    lines.push("");
+  }
 
-  lines.push("## Closing note");
-  lines.push("The backup issue should be treated as a clean interim brief, not the fully polished newsletter Chronicle normally aims to produce.");
-  lines.push("");
   lines.push(buildSourcesSection(packet));
   return lines.join("\n");
-}
-
-function buildLeadAngle(research, selectedSources, workingThesis) {
-  if (!selectedSources.length) {
-    return "The safest opening move is to say clearly what is known, what is still uncertain, and why that uncertainty matters.";
-  }
-
-  const firstSource = cleanupSourceTitle(selectedSources[0].title);
-  const themeTerms = extractThemeTerms(selectedSources, 3);
-  if (themeTerms.length >= 2) {
-    return `${firstSource} is the visible entry point, but the deeper story is the way ${themeTerms[0]} is now colliding with ${themeTerms[1]}.`;
-  }
-  return `${firstSource} is the clearest way into the week, but its real value is what it reveals about the broader direction of ${research.brief}.`;
-}
-
-function buildSectionAngles(sections, selectedSources) {
-  return sections.map((sectionName, index) => {
-    const source = selectedSources[index] || selectedSources[0];
-    if (!source) {
-      return `The most honest move in ${sectionName.toLowerCase()} is to stay explicit about what the evidence does and does not support.`;
-    }
-    if (/why it matters/i.test(sectionName)) {
-      return "Translate the week's developments into consequences, not just events.";
-    }
-    if (/key developments/i.test(sectionName)) {
-      return "Group the supporting signals that reinforce the thesis and separate signal from noise.";
-    }
-    if (/what to watch/i.test(sectionName)) {
-      return "Name the next pressure point or decision that could move the story.";
-    }
-    return "Start with the main shift that moved the story this week, then widen out to what it means.";
-  });
-}
-
-function buildClosingInsight(themeTerms, coverageGap) {
-  if (themeTerms.length >= 3) {
-    return `The deeper pattern is the clustering of ${themeTerms.slice(0, 3).join(", ")} in the same reporting window. ${coverageGap}`;
-  }
-  return `The most useful takeaway is the directional signal, not the volume of headlines. ${coverageGap}`;
-}
-
-function buildEditorialPlanSummary(packet) {
-  const sectionPlan = packet.sections
-    .slice(0, 3)
-    .map((sectionName, index) => `${sectionName}: ${packet.sectionAngles[index] || packet.workingThesis}`)
-    .join(" | ");
-  return sectionPlan;
-}
-
-function buildEditorialMemoText(editorialBrief) {
-  if (!editorialBrief) {
-    return "";
-  }
-  return [
-    `Core thesis: ${editorialBrief.coreThesis}`,
-    `Hidden pattern: ${editorialBrief.hiddenPattern}`,
-    `Killer insight: ${editorialBrief.killerInsight}`,
-    `Writing approach: ${editorialBrief.writingApproach}`,
-  ].join(" | ");
-}
-
-function buildVisibleReasoningNote(packet) {
-  if (packet.explanationStyle === "soc") {
-    return "Chronicle is framing the issue around the right questions first, then answering them in order.";
-  }
-  if (packet.explanationStyle === "feynman") {
-    return "Chronicle is simplifying the story without flattening the logic behind it.";
-  }
-  if (packet.explanationStyle === "custom" && packet.styleInstructions) {
-    return `Chronicle is following the custom writing guidance: ${trimText(packet.styleInstructions, 140)}`;
-  }
-  return "Chronicle is turning the source packet into one clean, argument-led newsletter.";
-}
-
-function describeGenerationStage(packet, partialText) {
-  const headingMatches = partialText.match(/^##\s+/gm) || [];
-  const headingCount = headingMatches.length;
-  const cleaned = partialText.trim();
-
-  if (!cleaned) {
-    return "Preparing the local writing pass.";
-  }
-  if (headingCount === 0 && cleaned.length < 220) {
-    return "Writing the headline and opening angle.";
-  }
-  if (headingCount < Math.max(1, Math.min(packet.sections.length, 2))) {
-    return `Drafting the first body section around ${packet.sections[0] || "the lead theme"}.`;
-  }
-  if (headingCount < packet.sections.length) {
-    return `Drafting the middle sections. ${headingCount}/${packet.sections.length} section headings are in place.`;
-  }
-  if (!/\n##\s+Closing note\b/i.test(partialText)) {
-    return "Writing the closing synthesis and tightening the throughline.";
-  }
-  if (!/\n##\s+Sources\b/i.test(partialText)) {
-    return "Assembling the source notes and final structure.";
-  }
-  return "Finalizing the local draft and checking citation structure.";
-}
-
-function extractEvidenceText(source) {
-  const cleanTitle = cleanupSourceTitle(source?.title || "");
-  const cleanSnippet = cleanEvidenceText(source?.snippet || "");
-  if (cleanSnippet && normalizeComparisonText(cleanSnippet) !== normalizeComparisonText(cleanTitle)) {
-    return cleanSnippet;
-  }
-
-  const raw = String(source?.source_text || source?.article_text || source?.snippet || "").trim();
-  if (!raw) {
-    return cleanTitle;
-  }
-
-  const snippetMatch = raw.match(/Snippet:\s*([\s\S]+)/i);
-  if (snippetMatch?.[1]) {
-    return cleanEvidenceText(snippetMatch[1]);
-  }
-
-  const cleaned = cleanEvidenceText(raw);
-  if (normalizeComparisonText(cleaned) === normalizeComparisonText(cleanTitle)) {
-    return cleanTitle;
-  }
-  return cleaned;
-}
-
-function cleanEvidenceText(text) {
-  return String(text || "")
-    .replace(/^Title:\s*/gim, "")
-    .replace(/^URL:\s*\S+\s*$/gim, "")
-    .replace(/^Snippet:\s*/gim, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeComparisonText(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[-–:|]/g, " ")
-    .replace(/\b(reuters|the new york times|nyt|dw|dw com|ap news|associated press|msn|aol\.com|yahoo news|the diplomat|al jazeera|britannica|toronto star|national post)\b/g, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function buildStyleGuidance(explanationStyle, customStyleInstructions) {
-  if (explanationStyle === "custom" && customStyleInstructions.trim()) {
-    return customStyleInstructions.trim();
-  }
-  if (explanationStyle === "feynman") {
-    return "Explain the story with plain language, clean causality, and minimal jargon. Make complexity feel understandable.";
-  }
-  if (explanationStyle === "soc") {
-    return "Lead with the right questions, answer them step by step, and let each section deepen the reader's understanding.";
-  }
-  return "Be concise, selective, and high-signal. Prefer strong interpretation over padded recap.";
-}
-
-function buildHeuristicEditorialBrief(research, selectedSources, workingThesis, leadAngle, coverageGap, themeTerms) {
-  const strongestSignal = cleanupSourceTitle(selectedSources[0]?.title || research.brief);
-  const secondarySignal = cleanupSourceTitle(selectedSources[1]?.title || "");
-  const pairedThemes = themeTerms.slice(0, 2).join(" and ");
-  const dominantFrame = pairedThemes || research.brief;
-
-  return {
-    coreThesis: selectedSources.length
-      ? `${leadAngle} The strongest usable reading is that ${strongestSignal} matters because it changes how readers should interpret the broader direction of ${research.brief}.`
-      : workingThesis,
-    hiddenPattern: secondarySignal
-      ? `The pattern beneath the headlines is convergence: ${strongestSignal} and ${secondarySignal} are not random adjacent stories, but signs that ${dominantFrame} is becoming the frame that organizes the week.`
-      : `The hidden pattern is that the same topic is appearing across multiple angles, which usually matters more than any single headline on its own.`,
-    killerInsight: `The right takeaway is not that the feed was busy. It is that the reporting window points toward a clearer narrative center, and that center is ${dominantFrame}.`,
-    writingApproach: buildStyleGuidance(research.explanation_style, research.style_instructions || ""),
-    proofPoints: selectedSources
-      .slice(0, 3)
-      .map((source) => cleanupSourceTitle(source.title)),
-    coverageGap,
-  };
-}
-
-function buildSectionLead(packet, sectionName, index) {
-  if (packet.explanationStyle === "soc") {
-    return `The right question in ${sectionName.toLowerCase()} is this: what actually moved, and why should the reader care?`;
-  }
-  if (packet.explanationStyle === "feynman") {
-    return `The simplest way to read ${sectionName.toLowerCase()} is to separate the visible headline from the deeper shift underneath it.`;
-  }
-  return `${packet.sectionAngles[index] || packet.editorialBrief.coreThesis}`;
-}
-
-function buildSectionParagraph(packet, sectionName, index) {
-  const primarySource = packet.selectedSources[index] || packet.selectedSources[0];
-  const secondarySource = packet.selectedSources[index + 1] || packet.selectedSources[1];
-  const sectionAngle = packet.sectionAngles[index] || packet.editorialBrief.coreThesis;
-
-  if (!primarySource) {
-    return "Chronicle could not verify enough fresh reporting for this section, so this draft stays explicit about that gap.";
-  }
-
-  const primaryNote = trimText(primarySource.sourceText || primarySource.snippet || "", 180);
-  const primaryCitation = `[${Math.min(index + 1, packet.selectedSources.length)}]`;
-  const secondaryCitation = secondarySource ? `[${Math.min(index + 2, packet.selectedSources.length)}]` : "";
-  const corroboration = secondarySource
-    ? ` A second signal from ${cleanupSourceTitle(secondarySource.title)} sharpens the same picture rather than overturning it. ${secondaryCitation}`
-    : "";
-
-  if (packet.explanationStyle === "soc") {
-    return `What does the evidence actually say? Start with ${cleanupSourceTitle(primarySource.title)}: ${primaryNote} ${primaryCitation}${corroboration}`.trim();
-  }
-  if (packet.explanationStyle === "feynman") {
-    return `${sectionAngle} In plain terms, ${cleanupSourceTitle(primarySource.title)} suggests ${primaryNote} ${primaryCitation}${corroboration}`.trim();
-  }
-  return `${sectionAngle} The clearest anchor is ${cleanupSourceTitle(primarySource.title)}, which suggests ${primaryNote} ${primaryCitation}${corroboration}`.trim();
-}
-
-function buildSectionImplication(packet, sectionName, index) {
-  const primarySource = packet.selectedSources[index] || packet.selectedSources[0];
-  const themeA = packet.themeTerms[0] || "policy";
-  const themeB = packet.themeTerms[1] || "execution";
-  if (!primarySource) {
-    return `The implication for ${sectionName.toLowerCase()} is that readers should treat this as a watchlist item until stronger verification arrives.`;
-  }
-
-  if (packet.explanationStyle === "soc") {
-    return `Why does that matter? Because the real signal is not the isolated event itself, but the way ${themeA} is starting to interact with ${themeB}. That is the frame the rest of the issue should answer.`;
-  }
-  if (packet.explanationStyle === "feynman") {
-    return `Why it matters: this is easier to understand if you treat ${themeA} and ${themeB} as connected pieces of the same story. Once they start moving together, the week stops looking random.`;
-  }
-  return `Why this matters: the section is less about one isolated update and more about how ${themeA} is beginning to interact with ${themeB}. For readers following ${packet.brief}, that is the durable signal worth carrying forward from this reporting window.`;
 }
 
 function buildSourcesSection(packet) {
@@ -985,6 +752,7 @@ function buildSourcesSection(packet) {
 
   return `## Sources\n${sources}${marketLine}`;
 }
+
 
 function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
@@ -1061,38 +829,36 @@ async function ensureBrowserSession() {
   throw new Error(lastError?.message || "No browser inference backend could be initialized.");
 }
 
-async function generateNewsletterMarkdown(research, packet, aiSession, onProgress) {
-  const messages = [
-    {
-      role: "system",
-      content: [
-        {
-          type: "text",
-          text: buildModeSystemPrompt(packet),
-        },
-      ],
-    },
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: buildNewsletterPrompt(research, packet),
-        },
-      ],
-    },
-  ];
-  const prompt = aiSession.processor.apply_chat_template(messages, {
-    add_generation_prompt: true,
-  });
-  const inputs = await aiSession.processor(prompt, null, null, {
-    add_special_tokens: false,
-  });
-  const inputLength = inputs.input_ids?.dims?.at(-1);
+async function generateNewsletterMarkdown(research, packet, aiSession, onProgress, isRetry = false) {
+  const promptVariants = buildPromptVariants(research, packet, isRetry);
+  let selectedVariant = null;
+  let selectedInputs = null;
+  let inputLength = 0;
 
-  if (!inputLength) {
-    throw new Error("Gemma 3n processor did not return input ids for generation.");
+  for (const variant of promptVariants) {
+    const prepared = await preparePromptInputs(aiSession, variant.promptText);
+    if (!prepared.inputLength) {
+      continue;
+    }
+    if (prepared.inputLength > aiSession.profile.maxInputTokens) {
+      console.warn(
+        `[Chronicle] Prompt variant "${variant.label}" too large: ${prepared.inputLength} tokens (limit ${aiSession.profile.maxInputTokens}).`,
+      );
+      continue;
+    }
+    selectedVariant = variant;
+    selectedInputs = prepared.inputs;
+    inputLength = prepared.inputLength;
+    break;
   }
+
+  if (!selectedVariant || !selectedInputs || !inputLength) {
+    throw new Error("Chronicle could not fit the newsletter prompt into the local model context window.");
+  }
+
+  console.log(
+    `[Chronicle] Using prompt variant "${selectedVariant.label}" with ${inputLength} input tokens.`,
+  );
 
   let streamedText = "";
   const streamer = aiSession.TextStreamer
@@ -1108,12 +874,10 @@ async function generateNewsletterMarkdown(research, packet, aiSession, onProgres
 
   const output = await withTimeout(
     aiSession.model.generate({
-      ...inputs,
+      ...selectedInputs,
       max_new_tokens: aiSession.profile.maxNewTokens,
-      do_sample: true,
-      temperature: aiSession.profile.temperature,
-      top_p: 0.9,
-      repetition_penalty: 1.12,
+      do_sample: false,
+      repetition_penalty: 1.15,
       streamer,
     }),
     aiSession.profile.generationTimeoutMs,
@@ -1125,6 +889,7 @@ async function generateNewsletterMarkdown(research, packet, aiSession, onProgres
   });
   const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
 
+  console.log("[Chronicle] Generated text length:", (generatedText || "").length, "streamed:", streamedText.length);
   if (!generatedText && !streamedText.trim()) {
     throw new Error("Browser model returned an empty response.");
   }
@@ -1132,119 +897,122 @@ async function generateNewsletterMarkdown(research, packet, aiSession, onProgres
 }
 
 function buildModeSystemPrompt(packet) {
-  const lines = [
-    "You are Chronicle, a premium newsletter writer.",
-    "Turn the source packet into a coherent argument-led newsletter.",
-    "Reason over the evidence before writing.",
-    "Write polished, grammatical prose with smooth transitions.",
-    "Never copy source text or headline phrasing into the body.",
-    "Use URLs only in the final Sources section.",
-  ];
-
   if (packet.explanationStyle === "feynman") {
-    lines.push("Explain difficult ideas in plain language without losing the causal logic.");
-  } else if (packet.explanationStyle === "soc") {
-    lines.push("Use a Socratic mode: organize the issue around the right questions and answers while keeping it readable.");
-  } else if (packet.explanationStyle === "custom" && packet.styleInstructions) {
-    lines.push(`Follow this custom writing guidance exactly: ${packet.styleInstructions}`);
-  } else {
-    lines.push("Be concise, selective, and high-signal.");
+    return "You are Chronicle. Think silently, find the central argument in the research notes, and explain it simply in markdown.";
   }
-
-  return lines.join("\n");
+  if (packet.explanationStyle === "soc") {
+    return "You are Chronicle. Think silently, form one argument, and write the newsletter as a sequence of sharp questions and answers in markdown.";
+  }
+  if (packet.explanationStyle === "custom" && packet.styleInstructions) {
+    return `You are Chronicle. Think silently, form one argument, and follow this style exactly: ${trimText(packet.styleInstructions, 160)}. Write in markdown.`;
+  }
+  return "You are Chronicle. Think silently, form one clear argument from the research notes, and write a concise analytical newsletter in markdown.";
 }
 
-function buildNewsletterPrompt(research, packet) {
-  const sourceBundle = packet.selectedSources
+function buildMinimalPrompt(research, packet) {
+  return buildNewsletterPrompt(research, packet, {
+    sourceLimit: 2,
+    evidenceChars: 70,
+    briefChars: 120,
+    sectionLimit: 3,
+    wordRange: "420-560",
+  });
+}
+
+function buildNewsletterPrompt(research, packet, options = {}) {
+  const maxSources = Math.max(1, options.sourceLimit || 3);
+  const evidenceChars = Math.max(50, options.evidenceChars || 100);
+  const briefChars = Math.max(80, options.briefChars || 180);
+  const sectionLimit = Math.max(2, options.sectionLimit || 3);
+  const wordRange = options.wordRange || "520-700";
+  const sourceLines = packet.selectedSources
+    .slice(0, maxSources)
     .map((source, index) => {
-      const excerpt = trimText(source.sourceText || "", 260);
-      return [
-        `[${index + 1}] ${cleanupSourceTitle(source.title)}`,
-        `Evidence notes: ${excerpt}`,
-      ].join("\n");
+      const title = cleanupSourceTitle(source.title);
+      const evidence = trimText(extractEvidenceText(source), evidenceChars);
+      return `[${index + 1}] ${title}: ${evidence}`;
     })
-    .join("\n\n");
+    .join("\n");
 
-  const marketData = research.market_snapshot?.length
-    ? JSON.stringify(research.market_snapshot)
-    : "No structured market data.";
+  return `${buildModeSystemPrompt(packet)}
 
-  const customStyle = research.style_instructions
-    ? `Custom style instructions: ${research.style_instructions}`
-    : "No custom style instructions.";
-
-  return `You are Chronicle, a sharp local-first newsletter writer.
-
-Think through the evidence silently first, then write one complete markdown newsletter.
-
-Newsletter brief:
-${research.brief}
-
-Title target:
-${research.plan.title}
-
-Audience:
-${research.plan.audience}
-
-Tone:
-${research.plan.tone}
-
-Depth:
-${research.depth}
-
-Explanation style:
-${research.explanation_style}
-
-Requested explanation guidance:
-${packet.styleGuidance}
-
-${customStyle}
-
-Coverage window:
-Last ${packet.days} days
-
-Planned sections:
-${JSON.stringify(packet.sections)}
+Topic: ${trimText(research.brief, briefChars)}
 
 Research notes:
-${sourceBundle || "No sources were collected."}
+${sourceLines || "No sources collected."}
 
-Structured market data:
-${marketData}
+Structure:
+${packet.sections.slice(0, sectionLimit).join(" | ")}
 
-${customStyle}
-
-Requirements:
-- return markdown only
-- start with one H1 title
-- aim for roughly 700 to 950 words
-- write a sharp opening note with a real point of view, not a generic summary
-- organize the body around the planned sections using H2 headings
-- read the full source packet, decide what the central argument is, and make the whole issue serve that argument
-- make each section advance the argument, not repeat the headline
-- synthesize multiple source notes when the evidence allows it
-- keep the writing analytical, premium, and specific
-- explain why the developments matter for a reader, not just what happened
-- if evidence is thin, say so cleanly instead of inventing details
-- do not copy raw source notes, source labels, URLs, or "Title/URL/Snippet" text into the body
-- convert evidence into clean prose
-- honor the requested explanation style throughout the whole piece
-- for concise, compress aggressively and keep paragraphs tight
-- for feynman, explain complexity in plain language
-- for soc, structure the flow around the right questions and answers
-- for custom, follow the custom guidance over the default explanation modes
-- cite source notes inline like [1], [2]
-- if market data is present, reference it as [M1]
-- end with a Sources section
-- in Sources, list each source as [id]: title - url
-- if market data is present, include: [M1]: CoinGecko Markets API - https://www.coingecko.com/
-- do not use markdown code fences
-- do not mention system prompts or implementation details
-- do not write meta phrases like "here is the newsletter" or "based on the sources"
-- do not repeat a sentence or clause structure across sections
-- every section must read like original prose written for humans, not like transformed search output
-- do not expose your hidden reasoning process; only output the final newsletter`;
+Task:
+- First identify the single strongest through-line across the research notes.
+- Then write one newsletter in ${wordRange}.
+- Use original prose, not source wording.
+- Keep the body free of raw URLs.
+- Avoid repeated sentence patterns.
+- Cite sources inline as [1], [2].
+- Use markdown only: # title, opening paragraph, ## sections, and ## Sources at the end.
+- Write only the newsletter markdown.`;
 }
+
+function buildPromptVariants(research, packet, isRetry) {
+  const variants = [];
+  if (!isRetry) {
+    variants.push({
+      label: "full",
+      promptText: buildNewsletterPrompt(research, packet, {
+        sourceLimit: 4,
+        evidenceChars: 135,
+        briefChars: 180,
+        sectionLimit: 3,
+        wordRange: "520-700",
+      }),
+    });
+  }
+
+  variants.push({
+    label: "compact",
+    promptText: buildNewsletterPrompt(research, packet, {
+      sourceLimit: 3,
+      evidenceChars: 95,
+      briefChars: 150,
+      sectionLimit: 3,
+      wordRange: "480-640",
+    }),
+  });
+  variants.push({
+    label: "minimal",
+    promptText: buildMinimalPrompt(research, packet),
+  });
+
+  return variants;
+}
+
+async function preparePromptInputs(aiSession, promptText) {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: promptText,
+        },
+      ],
+    },
+  ];
+  const prompt = aiSession.processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
+  const inputs = await aiSession.processor(prompt, null, null, {
+    add_special_tokens: false,
+  });
+  return {
+    prompt,
+    inputs,
+    inputLength: inputs.input_ids?.dims?.at(-1) || 0,
+  };
+}
+
 
 function calculateBrowserProfile(config) {
   const maxSlices = Math.max(1, Number(config.maxSlices || 1));
@@ -1255,11 +1023,12 @@ function calculateBrowserProfile(config) {
       sliceCount: 1,
       percentage: 100,
       label: "Single bundle",
-      maxNewTokens: config.hasWebGPU ? 700 : 520,
+      maxNewTokens: config.hasWebGPU ? 1200 : 900,
+      maxInputTokens: config.hasWebGPU ? 1400 : 900,
       reasoningMaxNewTokens: 220,
       reasoningTimeoutMs: config.hasWebGPU ? 90000 : 75000,
-      generationTimeoutMs: config.hasWebGPU ? 240000 : 210000,
-      temperature: 0.65,
+      generationTimeoutMs: config.hasWebGPU ? 300000 : 240000,
+      temperature: 0.55,
     };
   }
 
@@ -1277,11 +1046,11 @@ function calculateBrowserProfile(config) {
   }
 
   const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 520;
+  let maxNewTokens = 900;
   if (percentage >= 50) {
-    maxNewTokens = 760;
+    maxNewTokens = 1200;
   } else if (percentage >= 25) {
-    maxNewTokens = 620;
+    maxNewTokens = 1000;
   }
 
   return {
@@ -1289,6 +1058,7 @@ function calculateBrowserProfile(config) {
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     maxNewTokens,
+    maxInputTokens: percentage >= 50 ? 1400 : percentage >= 25 ? 1150 : 900,
     reasoningMaxNewTokens: 220,
     reasoningTimeoutMs: percentage >= 50 ? 100000 : 80000,
     generationTimeoutMs: percentage >= 50 ? 240000 : 210000,
@@ -1332,8 +1102,11 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     ? `${percentage}% slice (${normalizedSliceCount}/${maxSlices})`
     : "Single bundle";
   const maxNewTokens = device === "webgpu"
-    ? Math.max(240, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 40)
-    : Math.min(220, recommendedProfile.maxNewTokens);
+    ? Math.max(800, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 40)
+    : Math.max(800, recommendedProfile.maxNewTokens);
+  const maxInputTokens = device === "webgpu"
+    ? Math.max(850, recommendedProfile.maxInputTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 120)
+    : Math.min(900, recommendedProfile.maxInputTokens);
   const modelOptions = { device };
 
   if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {
@@ -1352,6 +1125,7 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     sliceLabel,
     percentage,
     maxNewTokens,
+    maxInputTokens,
     generationTimeoutMs: device === "webgpu"
       ? Math.max(70000, recommendedProfile.generationTimeoutMs - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 10000)
       : Math.min(70000, recommendedProfile.generationTimeoutMs),
@@ -1383,6 +1157,20 @@ function dedupeCandidates(candidates) {
     seen.add(key);
     return true;
   });
+}
+
+function reportClientError(context, error) {
+  try {
+    fetch("/api/client-error", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        context,
+        message: error?.message || String(error),
+        stack: error?.stack || "",
+      }),
+    }).catch(() => {});
+  } catch (_) {}
 }
 
 async function fetchJSON(url, options = {}) {
@@ -1435,4 +1223,8 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
