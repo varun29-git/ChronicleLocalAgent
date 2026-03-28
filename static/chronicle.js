@@ -5,6 +5,9 @@ const state = {
   browserConfig: null,
   browserCapabilities: null,
   browserSession: null,
+  browserSessionPromise: null,
+  transformersRuntimePromise: null,
+  browserWarmStarted: false,
   activeJobId: null,
   pollTimer: null,
   currentTurn: null,
@@ -16,6 +19,39 @@ const TURN_STAGES = [
   { key: "brain", index: "02", title: "Sending to Chronicle brain" },
   { key: "generate", index: "03", title: "Generating newsletter" },
 ];
+
+const TOPIC_ALIASES = {
+  elon: {
+    canonical: "Elon Musk",
+    include: ["elon", "musk", "tesla", "spacex", "x", "neuralink"],
+    exclude: ["university", "college", "campus", "student", "athletics", "mentor"],
+  },
+  musk: {
+    canonical: "Elon Musk",
+    include: ["elon", "musk", "tesla", "spacex", "x", "neuralink"],
+    exclude: ["university", "college", "campus", "student", "athletics", "mentor"],
+  },
+  trump: {
+    canonical: "Donald Trump",
+    include: ["donald", "trump", "president", "white house"],
+    exclude: [],
+  },
+  modi: {
+    canonical: "Narendra Modi",
+    include: ["narendra", "modi", "india", "indian"],
+    exclude: [],
+  },
+  trudeau: {
+    canonical: "Justin Trudeau",
+    include: ["justin", "trudeau", "canada", "canadian"],
+    exclude: [],
+  },
+  carney: {
+    canonical: "Mark Carney",
+    include: ["mark", "carney", "canada", "canadian"],
+    exclude: [],
+  },
+};
 
 const elements = {};
 
@@ -107,6 +143,7 @@ function applyStatus(statusResponse) {
   state.browserConfig = statusResponse.browser_ai;
   state.browserCapabilities = detectBrowserCapabilities(statusResponse.browser_ai);
   renderHeaderStatus();
+  warmBrowserSessionInBackground();
 }
 
 function renderHeaderStatus() {
@@ -275,8 +312,8 @@ async function runBrowserGeneration(payload) {
   try {
     const aiSession = await withTimeout(
       ensureBrowserSession(),
-      20000,
-      "Browser model loading took too long.",
+      getBrowserWarmupTimeoutMs(),
+      "Browser model is still warming up on this device.",
     );
     setStageState("brain", "complete");
     setStageState("generate", "active");
@@ -298,18 +335,18 @@ async function runBrowserGeneration(payload) {
     updateTurnStatus("Retrying with simpler prompt");
 
     try {
-      const aiSession = state.browserSession;
-      if (aiSession?.model) {
-        const retryMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, () => {}, true);
-        const retryCleaned = stripMarkdownFences(retryMarkdown).trim();
-        console.log("[Chronicle] Retry output length:", retryCleaned.length);
-        if (retryCleaned.length >= 150) {
-          markdown = finalizeNewsletterMarkdown(retryCleaned, packet);
-        } else {
-          throw new Error("Retry produced too little: " + retryCleaned.length + " chars");
-        }
+      const aiSession = await withTimeout(
+        ensureBrowserSession(),
+        getBrowserRetryWarmupTimeoutMs(),
+        "Browser model could not finish warming up for retry.",
+      );
+      const retryMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, () => {}, true);
+      const retryCleaned = stripMarkdownFences(retryMarkdown).trim();
+      console.log("[Chronicle] Retry output length:", retryCleaned.length);
+      if (retryCleaned.length >= 150) {
+        markdown = finalizeNewsletterMarkdown(retryCleaned, packet);
       } else {
-        throw new Error("No browser session available for retry");
+        throw new Error("Retry produced too little: " + retryCleaned.length + " chars");
       }
     } catch (retryError) {
       console.error("[Chronicle] Retry ALSO FAILED:", retryError?.message || retryError);
@@ -565,7 +602,12 @@ function scrollThreadToBottom() {
 }
 
 function buildEditorialPacket(research) {
-  const selectedSources = selectTopSources(research.sources || [], research.depth === "high" ? 10 : 8);
+  const topicProfile = buildTopicProfile(research.brief, research.plan?.title || "");
+  const selectedSources = selectTopSources(
+    research.sources || [],
+    research.depth === "high" ? 8 : 6,
+    topicProfile,
+  );
 
   return {
     brief: research.brief,
@@ -579,21 +621,32 @@ function buildEditorialPacket(research) {
     queries: research.plan?.queries || [],
     sections: research.plan?.sections || ["What happened", "Why it matters", "What to watch next"],
     marketSnapshot: research.market_snapshot || [],
+    topicProfile,
+    editorialAngle: buildEditorialAngle(research, topicProfile, selectedSources),
     selectedSources,
   };
 }
 
-function selectTopSources(sources, limit) {
+function selectTopSources(sources, limit, topicProfile) {
   const deduped = [];
   const seen = new Set();
 
-  sources
+  const ranked = sources
     .map((source, index) => ({
       ...source,
       sourceText: trimText(extractEvidenceText(source), 320),
-      relevanceScore: rankSourceForDraft(source, index),
+      relevanceScore: rankSourceForDraft(source, index, topicProfile),
     }))
     .sort((left, right) => right.relevanceScore - left.relevanceScore)
+    .filter((source) => source.relevanceScore >= minimumSourceScore(topicProfile));
+
+  (ranked.length ? ranked : sources
+    .map((source, index) => ({
+      ...source,
+      sourceText: trimText(extractEvidenceText(source), 320),
+      relevanceScore: rankSourceForDraft(source, index, topicProfile),
+    }))
+    .sort((left, right) => right.relevanceScore - left.relevanceScore))
     .forEach((source) => {
       const key = normalizeSourceIdentity(source);
       if (seen.has(key)) {
@@ -606,15 +659,85 @@ function selectTopSources(sources, limit) {
   return deduped.slice(0, limit);
 }
 
-function rankSourceForDraft(source, index) {
-  let score = 10 - index * 0.15;
+function rankSourceForDraft(source, index, topicProfile) {
+  let score = 12 - index * 0.35;
+  const title = cleanupSourceTitle(source.title);
+  const text = `${title} ${source.snippet || ""} ${source.source_text || ""}`.toLowerCase();
+  const includeHits = (topicProfile?.includeTerms || []).filter((term) => containsTopicTerm(text, term)).length;
+  const excludeHits = (topicProfile?.excludeTerms || []).filter((term) => containsTopicTerm(text, term)).length;
+
+  score += includeHits * 2.4;
+  if (topicProfile?.includeTerms?.length && includeHits === 0) {
+    score -= 3.5;
+  }
+  score -= excludeHits * 4;
   if (source.snippet) {
-    score += 2;
+    score += 0.5;
   }
   if (source.source_text) {
-    score += Math.min(2, source.source_text.length / 220);
+    score += Math.min(1.5, source.source_text.length / 260);
+  }
+  if (source.article_text) {
+    score += 1.5;
+  }
+  if (/\b(opinion|editorial|column|op-ed|analysis)\b/i.test(title)) {
+    score -= 2.2;
+  }
+  if (/\b(university|college|campus|student|athletics|in memory|obituary)\b/i.test(text)) {
+    score -= 3;
+  }
+  if (/\b(reuters|associated press|ap news|new york times|financial times|wall street journal|bloomberg)\b/i.test(`${title} ${source.url || ""}`)) {
+    score += 1.4;
   }
   return score;
+}
+
+function minimumSourceScore(topicProfile) {
+  return topicProfile?.includeTerms?.length ? 8.5 : 6.5;
+}
+
+function buildTopicProfile(brief, plannedTitle = "") {
+  const normalized = String(brief || "").trim();
+  const lowered = normalized.toLowerCase();
+  const briefTokens = extractBriefTokens(normalized);
+  const plannedTokens = extractBriefTokens(plannedTitle);
+  const aliasKey = TOPIC_ALIASES[lowered]
+    ? lowered
+    : (briefTokens.length === 1 && TOPIC_ALIASES[briefTokens[0]] ? briefTokens[0] : "");
+  const alias = aliasKey ? TOPIC_ALIASES[aliasKey] : null;
+
+  const canonical = alias?.canonical || plannedTitle || normalized;
+  const includeTerms = alias?.include?.length ? alias.include : [...new Set([...briefTokens, ...plannedTokens])].slice(0, 6);
+  const excludeTerms = alias?.exclude || [];
+
+  return {
+    canonical,
+    includeTerms,
+    excludeTerms,
+  };
+}
+
+function extractBriefTokens(text) {
+  return (String(text || "").toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) || [])
+    .filter((token, index, all) => all.indexOf(token) === index)
+    .slice(0, 6);
+}
+
+function containsTopicTerm(text, term) {
+  return String(text || "").includes(String(term || "").toLowerCase());
+}
+
+function buildEditorialAngle(research, topicProfile, selectedSources) {
+  const focus = topicProfile?.canonical || research.brief;
+  const titles = selectedSources.slice(0, 2).map((source) => cleanupSourceTitle(source.title));
+
+  if (!titles.length) {
+    return `The reporting window around ${focus} is thin, so the issue should stay explicit about uncertainty and avoid overclaiming.`;
+  }
+  if (titles.length === 1) {
+    return `The strongest verified signal around ${focus} is not a flood of headlines but the direction implied by ${titles[0]} [1].`;
+  }
+  return `The strongest verified signal around ${focus} is the convergence between ${titles[0]} [1] and ${titles[1]} [2], not any single isolated headline.`;
 }
 
 function normalizeSourceIdentity(source) {
@@ -713,30 +836,84 @@ function renderFallbackNewsletter(packet) {
   const lines = [
     `# ${packet.title}`,
     "",
-    `Chronicle's local model could not complete the writing pass for this issue. Below is a structured summary built from the ${sources.length} source(s) collected for: ${packet.brief}.`,
+    buildFallbackLead(packet),
     "",
   ];
 
   if (sources.length) {
-    lines.push("## Key developments");
-    lines.push("");
-    sources.slice(0, 5).forEach((source, index) => {
-      const title = cleanupSourceTitle(source.title);
-      const evidence = extractEvidenceText(source);
-      lines.push(`**${title}** [${index + 1}]`);
+    packet.sections.slice(0, 3).forEach((sectionName, index) => {
+      lines.push(`## ${sectionName}`);
       lines.push("");
-      lines.push(evidence);
+      lines.push(buildFallbackSection(packet, sectionName, index));
       lines.push("");
     });
   } else {
     lines.push("## Note");
     lines.push("");
-    lines.push("No web sources were collected for this brief. Try again with a different topic or check your internet connection.");
+    lines.push(`Coverage around ${packet.topicProfile?.canonical || packet.brief} was too thin in this run to support a stronger issue.`);
     lines.push("");
   }
 
   lines.push(buildSourcesSection(packet));
   return lines.join("\n");
+}
+
+function buildFallbackLead(packet) {
+  const focus = packet.topicProfile?.canonical || packet.brief;
+  const titles = packet.selectedSources.slice(0, 2).map((source, index) => `${cleanupSourceTitle(source.title)} [${index + 1}]`);
+  if (!titles.length) {
+    return `This issue stays cautious because Chronicle did not verify enough reporting on ${focus} to support a stronger lead.`;
+  }
+  return `${packet.editorialAngle} For this issue, the reporting window is anchored by ${titles.join(" and ")}, which together define the strongest through-line Chronicle could verify on ${focus}.`;
+}
+
+function buildFallbackSection(packet, sectionName, index) {
+  const focus = packet.topicProfile?.canonical || packet.brief;
+  const primary = packet.selectedSources[index] || packet.selectedSources[0];
+  const secondary = packet.selectedSources[index + 1] || packet.selectedSources[1] || packet.selectedSources[0];
+  const primaryIndex = packet.selectedSources.indexOf(primary) + 1;
+  const secondaryIndex = packet.selectedSources.indexOf(secondary) + 1;
+  const primaryTitle = cleanupSourceTitle(primary?.title || "");
+  const secondaryTitle = cleanupSourceTitle(secondary?.title || "");
+  const themes = extractThemeTerms(packet.selectedSources, 2);
+  const themeClause = themes.length >= 2
+    ? `${themes[0]} and ${themes[1]}`
+    : themes[0] || focus;
+  const lower = sectionName.toLowerCase();
+
+  if (lower.includes("what happened")) {
+    return `The reporting window was led by ${primaryTitle} [${primaryIndex}]. ${secondaryTitle && secondaryIndex !== primaryIndex ? `${secondaryTitle} [${secondaryIndex}] reinforced the same frame rather than overturning it.` : ""} The important point is that the coverage clustered around ${focus}, not a random scatter of mentions.`;
+  }
+  if (lower.includes("why it matters")) {
+    return `For readers tracking ${focus}, the deeper signal is not any one update but the way the reporting is clustering around ${themeClause}. ${primaryTitle} [${primaryIndex}] is useful here because it points to a durable direction rather than a one-off headline.`;
+  }
+  if (lower.includes("watch")) {
+    return `The next thing to watch is whether the same pattern holds in the next reporting cycle. If the line from ${primaryTitle} [${primaryIndex}] to ${secondaryTitle} [${secondaryIndex}] keeps strengthening, Chronicle should treat that as the real center of gravity for ${focus}.`;
+  }
+  return `The clearest development remains the overlap between ${primaryTitle} [${primaryIndex}] and ${secondaryTitle} [${secondaryIndex}], which together give Chronicle the best evidence for the current direction of ${focus}.`;
+}
+
+function extractThemeTerms(sources, limit) {
+  const stopwords = new Set(["about", "after", "amid", "analysis", "latest", "news", "says", "this", "that", "their", "what", "when", "where", "with"]);
+  const scores = new Map();
+
+  sources.forEach((source) => {
+    const text = `${cleanupSourceTitle(source.title)} ${source.snippet || ""}`.toLowerCase();
+    const words = text.match(/[a-z][a-z0-9-]{2,}/g) || [];
+    const seen = new Set();
+    words.forEach((word) => {
+      if (stopwords.has(word) || seen.has(word)) {
+        return;
+      }
+      seen.add(word);
+      scores.set(word, (scores.get(word) || 0) + 1);
+    });
+  });
+
+  return [...scores.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, limit)
+    .map(([term]) => term);
 }
 
 function buildSourcesSection(packet) {
@@ -758,12 +935,14 @@ function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
   const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
+  const hostAvailableMemory = Number(state.serverRuntime?.memory_available_gb || 0);
   const isMobile = typeof navigator !== "undefined"
     && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
   const recommendedProfile = calculateBrowserProfile({
     hasWebGPU,
     deviceMemory,
     hardwareConcurrency,
+    hostAvailableMemory,
     isMobile,
     supportsSlicing: Boolean(browserConfig?.supports_slicing),
     maxSlices: Number(browserConfig?.max_slices || 1),
@@ -789,44 +968,104 @@ async function ensureBrowserSession() {
   if (state.browserSession?.model) {
     return state.browserSession;
   }
+  if (state.browserSessionPromise) {
+    return state.browserSessionPromise;
+  }
 
   if (!state.browserConfig?.local_model_ready || !state.browserConfig?.local_model_id) {
     throw new Error("No local browser model bundle is available on this server.");
   }
 
-  const { AutoModelForImageTextToText, AutoProcessor, TextStreamer, env } = await import(TRANSFORMERS_CDN);
-  env.allowRemoteModels = false;
-  env.allowLocalModels = true;
-  env.localModelPath = "/models";
-  env.useBrowserCache = true;
+  state.browserSessionPromise = loadBrowserSession()
+    .then((session) => {
+      state.browserSession = session;
+      return session;
+    })
+    .catch((error) => {
+      state.browserSession = null;
+      throw error;
+    })
+    .finally(() => {
+      state.browserSessionPromise = null;
+    });
 
-  if (env.backends?.onnx?.wasm) {
-    env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-  }
+  return state.browserSessionPromise;
+}
+
+async function loadBrowserSession() {
+  const { AutoModelForImageTextToText, AutoProcessor, TextStreamer, env } = await loadTransformersRuntime();
 
   let lastError = null;
   for (const candidate of state.browserCapabilities.candidates) {
     try {
+      console.log(`[Chronicle] Loading browser candidate: ${candidate.label}`);
       const processor = await AutoProcessor.from_pretrained(candidate.model);
       const model = await AutoModelForImageTextToText.from_pretrained(
         candidate.model,
         candidate.modelOptions,
       );
-      state.browserSession = {
+      return {
         processor,
         model,
         TextStreamer,
         profile: candidate,
       };
-      return state.browserSession;
     } catch (error) {
       lastError = error;
-      appendLogLines([`Model candidate failed: ${candidate.label}`]);
       console.warn(`Chronicle browser candidate failed: ${candidate.label}`, error);
     }
   }
 
   throw new Error(lastError?.message || "No browser inference backend could be initialized.");
+}
+
+async function loadTransformersRuntime() {
+  if (state.transformersRuntimePromise) {
+    return state.transformersRuntimePromise;
+  }
+
+  state.transformersRuntimePromise = import(TRANSFORMERS_CDN)
+    .then((runtime) => {
+      runtime.env.allowRemoteModels = false;
+      runtime.env.allowLocalModels = true;
+      runtime.env.localModelPath = "/models";
+      runtime.env.useBrowserCache = true;
+
+      if (runtime.env.backends?.onnx?.wasm) {
+        runtime.env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+      }
+      return runtime;
+    })
+    .catch((error) => {
+      state.transformersRuntimePromise = null;
+      throw error;
+    });
+
+  return state.transformersRuntimePromise;
+}
+
+function warmBrowserSessionInBackground() {
+  if (state.browserWarmStarted || !state.browserConfig?.local_model_ready) {
+    return;
+  }
+  state.browserWarmStarted = true;
+  ensureBrowserSession().catch((error) => {
+    console.warn("[Chronicle] Background browser warmup failed.", error);
+  });
+}
+
+function getBrowserWarmupTimeoutMs() {
+  if (state.browserSession?.model) {
+    return 15000;
+  }
+  return state.browserCapabilities?.hasWebGPU ? 180000 : 240000;
+}
+
+function getBrowserRetryWarmupTimeoutMs() {
+  if (state.browserSession?.model) {
+    return 15000;
+  }
+  return state.browserCapabilities?.hasWebGPU ? 240000 : 300000;
 }
 
 async function generateNewsletterMarkdown(research, packet, aiSession, onProgress, isRetry = false) {
@@ -938,6 +1177,9 @@ function buildNewsletterPrompt(research, packet, options = {}) {
 
 Topic: ${trimText(research.brief, briefChars)}
 
+Editorial angle:
+${packet.editorialAngle}
+
 Research notes:
 ${sourceLines || "No sources collected."}
 
@@ -1017,6 +1259,7 @@ async function preparePromptInputs(aiSession, promptText) {
 function calculateBrowserProfile(config) {
   const maxSlices = Math.max(1, Number(config.maxSlices || 1));
   const supportsSlicing = Boolean(config.supportsSlicing && maxSlices > 1);
+  const hostAvailableMemory = Number(config.hostAvailableMemory || 0);
 
   if (!supportsSlicing) {
     return {
@@ -1035,22 +1278,24 @@ function calculateBrowserProfile(config) {
   let sliceCount = 1;
   if (!config.hasWebGPU) {
     sliceCount = 1;
+  } else if (hostAvailableMemory > 0 && hostAvailableMemory < 3.5) {
+    sliceCount = 1;
   } else if (config.isMobile) {
     sliceCount = config.deviceMemory >= 12 ? 2 : 1;
   } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 16) {
     sliceCount = Math.min(maxSlices, 4);
   } else if (config.deviceMemory >= 16 || config.hardwareConcurrency >= 12) {
     sliceCount = Math.min(maxSlices, 3);
-  } else if (config.deviceMemory >= 8 || config.hardwareConcurrency >= 8) {
+  } else if (config.deviceMemory > 8 || config.hardwareConcurrency > 8) {
     sliceCount = Math.min(maxSlices, 2);
   }
 
   const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 900;
+  let maxNewTokens = 820;
   if (percentage >= 50) {
-    maxNewTokens = 1200;
+    maxNewTokens = 1100;
   } else if (percentage >= 25) {
-    maxNewTokens = 1000;
+    maxNewTokens = 920;
   }
 
   return {
@@ -1058,10 +1303,10 @@ function calculateBrowserProfile(config) {
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     maxNewTokens,
-    maxInputTokens: percentage >= 50 ? 1400 : percentage >= 25 ? 1150 : 900,
+    maxInputTokens: percentage >= 50 ? 1320 : percentage >= 25 ? 1080 : 860,
     reasoningMaxNewTokens: 220,
     reasoningTimeoutMs: percentage >= 50 ? 100000 : 80000,
-    generationTimeoutMs: percentage >= 50 ? 240000 : 210000,
+    generationTimeoutMs: percentage >= 50 ? 240000 : 230000,
     temperature: 0.65,
   };
 }

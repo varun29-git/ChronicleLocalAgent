@@ -7,39 +7,32 @@ import re
 import sqlite3
 import ssl
 import subprocess
-import sys
 import time
-import urllib.parse
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 
 from newsletter_schema import DB_PATH, initialize_database
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = os.environ.get(
     "NEWSLETTER_AGENT_MODEL_ROOT",
-    os.path.join(PROJECT_ROOT, "models"),
+    str((PROJECT_ROOT / "models").resolve()),
 )
-DEFAULT_MLX_MODEL_REPO = "mlx-community/gemma-3-4b-it-4bit"
-DEFAULT_TRANSFORMERS_MODEL_REPO = "google/gemma-2-2b-it"
-DEFAULT_LOCAL_MLX_MODEL_PATH = os.path.join(
-    DEFAULT_MODEL_ROOT,
-    "mlx-community",
-    "gemma-3-4b-it-4bit",
+
+DEFAULT_MLX_MODEL_PATH = os.environ.get(
+    "NEWSLETTER_AGENT_MODEL_MLX",
+    str((Path(DEFAULT_MODEL_ROOT) / "mlx-community" / "gemma-3-4b-it-4bit").resolve()),
 )
-DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH = os.path.join(
-    DEFAULT_MODEL_ROOT,
-    "google",
-    "gemma-2-2b-it",
-)
-DEFAULT_MLX_MODEL_PATH = DEFAULT_LOCAL_MLX_MODEL_PATH
 DEFAULT_TRANSFORMERS_MODEL_PATH = os.environ.get(
     "NEWSLETTER_AGENT_MODEL_TRANSFORMERS",
-    os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH),
+    str((Path(DEFAULT_MODEL_ROOT) / "google" / "gemma-2-2b-it").resolve()),
 )
 DEFAULT_MODEL_PATH = os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_MLX_MODEL_PATH)
+
 DEFAULT_BROWSER_MODEL_ID = os.environ.get("NEWSLETTER_AGENT_BROWSER_MODEL_ID", "").strip()
 DEFAULT_BROWSER_MODEL_CANDIDATES = tuple(
     candidate
@@ -53,16 +46,20 @@ DEFAULT_BROWSER_MODEL_CANDIDATES = tuple(
     )
     if candidate
 )
+
 DEFAULT_DAYS = 7
 DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
-MAX_ARTICLE_CHARS = 8000
-REQUEST_TIMEOUT_SECONDS = 5
+MAX_ARTICLE_CHARS = 1600
+REQUEST_TIMEOUT_SECONDS = 6
 DEFAULT_RAM_RESERVE_GB = float(os.environ.get("NEWSLETTER_AGENT_RAM_RESERVE_GB", "4"))
 MAX_NEWSLETTER_RUNTIME_SECONDS = int(
     float(os.environ.get("NEWSLETTER_AGENT_MAX_RUNTIME_SECONDS", "300"))
 )
-DEFAULT_WRITING_STYLE = "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
+DEFAULT_WRITING_STYLE = (
+    "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
+)
+
 SEARCH_NOISE_WORDS = {
     "a",
     "about",
@@ -110,6 +107,76 @@ SEARCH_NOISE_WORDS = {
     "why",
     "yesterday",
 }
+
+TOPIC_ALIASES = {
+    "elon": {
+        "canonical": "Elon Musk",
+        "title": "Elon Musk",
+        "include_terms": ("elon", "musk", "tesla", "spacex", "x", "neuralink"),
+        "exclude_terms": ("university", "college", "campus", "student", "athletics", "mentor"),
+    },
+    "musk": {
+        "canonical": "Elon Musk",
+        "title": "Elon Musk",
+        "include_terms": ("elon", "musk", "tesla", "spacex", "x", "neuralink"),
+        "exclude_terms": ("university", "college", "campus", "student", "athletics", "mentor"),
+    },
+    "trump": {
+        "canonical": "Donald Trump",
+        "title": "Donald Trump",
+        "include_terms": ("donald", "trump", "president", "white house"),
+        "exclude_terms": (),
+    },
+    "modi": {
+        "canonical": "Narendra Modi",
+        "title": "Narendra Modi",
+        "include_terms": ("narendra", "modi", "india", "indian"),
+        "exclude_terms": (),
+    },
+    "trudeau": {
+        "canonical": "Justin Trudeau",
+        "title": "Justin Trudeau",
+        "include_terms": ("justin", "trudeau", "canada", "canadian"),
+        "exclude_terms": (),
+    },
+    "carney": {
+        "canonical": "Mark Carney",
+        "title": "Mark Carney",
+        "include_terms": ("mark", "carney", "canada", "canadian"),
+        "exclude_terms": (),
+    },
+}
+
+EXPLANATION_STYLE_GUIDANCE = {
+    "concise": "Be tight, selective, and high-signal. Short paragraphs. No filler.",
+    "feynman": "Explain clearly in plain language, as if teaching an intelligent beginner.",
+    "soc": "Use a Socratic question-and-answer structure that guides the reader through the topic.",
+}
+
+DEPTH_PRESETS = {
+    "low": {
+        "query_limit": 2,
+        "results_per_query": 2,
+        "article_chars": 0,
+        "newsletter_tokens": 520,
+        "research_budget_seconds": 15,
+    },
+    "medium": {
+        "query_limit": 4,
+        "results_per_query": 3,
+        "article_chars": 900,
+        "newsletter_tokens": 680,
+        "research_budget_seconds": 35,
+    },
+    "high": {
+        "query_limit": 5,
+        "results_per_query": 4,
+        "article_chars": 1200,
+        "newsletter_tokens": 820,
+        "research_budget_seconds": 60,
+    },
+}
+
 SLICE_MODEL_PATHS = {
     0.125: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_12_5", DEFAULT_MODEL_PATH),
     0.25: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_25", DEFAULT_MODEL_PATH),
@@ -117,823 +184,420 @@ SLICE_MODEL_PATHS = {
     0.75: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_75", DEFAULT_MODEL_PATH),
     1.00: os.environ.get("NEWSLETTER_AGENT_MODEL_SLICE_100", DEFAULT_MODEL_PATH),
 }
-EXPLANATION_STYLE_GUIDANCE = {
-    "concise": "Explain ideas briefly and cleanly. Prioritize compression, signal, and fast readability.",
-    "feynman": "Explain ideas simply and clearly, as if teaching an intelligent beginner. Break down jargon into plain language without sounding childish.",
-    "soc": "Explain in a Socratic style. Lead the reader through the idea by posing and answering the right questions step by step, while staying concise and clear.",
-}
-DEPTH_PRESETS = {
-    "low": {
-        "query_limit": 2,
-        "results_per_query": 2,
-        "article_chars": 0,
-        "summary_tokens": 100,
-        "newsletter_tokens": 520,
-        "research_budget_seconds": 12,
-    },
-    "medium": {
-        "query_limit": 4,
-        "results_per_query": 3,
-        "article_chars": 1200,
-        "summary_tokens": 120,
-        "newsletter_tokens": 620,
-        "research_budget_seconds": 35,
-    },
-    "high": {
-        "query_limit": 5,
-        "results_per_query": 3,
-        "article_chars": 1800,
-        "summary_tokens": 160,
-        "newsletter_tokens": 760,
-        "research_budget_seconds": 60,
-    },
-}
-MODEL_PROFILES = {
-    "constrained": {
-        "model_path": os.environ.get("NEWSLETTER_AGENT_MODEL_LOW", DEFAULT_MODEL_PATH),
-        "draft_model_path": os.environ.get("NEWSLETTER_AGENT_DRAFT_MODEL_LOW", ""),
-        "lazy": True,
-        "num_draft_tokens": 0,
-    },
-    "balanced": {
-        "model_path": os.environ.get("NEWSLETTER_AGENT_MODEL_MEDIUM", DEFAULT_MODEL_PATH),
-        "draft_model_path": os.environ.get("NEWSLETTER_AGENT_DRAFT_MODEL_MEDIUM", ""),
-        "lazy": False,
-        "num_draft_tokens": 0,
-    },
-    "expanded": {
-        "model_path": os.environ.get("NEWSLETTER_AGENT_MODEL_HIGH", DEFAULT_MODEL_PATH),
-        "draft_model_path": os.environ.get("NEWSLETTER_AGENT_DRAFT_MODEL_HIGH", ""),
-        "lazy": False,
-        "num_draft_tokens": 4,
-    },
-}
+
 INSECURE_SSL_CONTEXT = ssl._create_unverified_context()
-initialize_database()
 
 MODEL = None
 TOKENIZER = None
 MODEL_RUNTIME = None
 DEVICE_CLASS_OVERRIDE = os.environ.get("NEWSLETTER_AGENT_DEVICE_CLASS", "").strip().lower() or None
 
+initialize_database()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Local newsletter research agent")
+    parser = argparse.ArgumentParser(description="Chronicle local newsletter agent")
     parser.add_argument("--brief", help="Newsletter brief or topic")
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
-    parser.add_argument("--depth", choices=("low", "medium", "high"))
-    parser.add_argument("--device-class", choices=("macbook", "midrange_laptop", "gaming_laptop", "midrange_phone", "flagship_phone"))
-    parser.add_argument("--explanation-style", choices=("concise", "feynman", "soc", "custom"))
-    parser.add_argument("--style-instructions")
+    parser.add_argument("--depth", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument(
+        "--device-class",
+        choices=("macbook", "midrange_laptop", "gaming_laptop", "midrange_phone", "flagship_phone"),
+    )
+    parser.add_argument(
+        "--explanation-style",
+        choices=("concise", "feynman", "soc", "custom"),
+        default="concise",
+    )
+    parser.add_argument("--style-instructions", default="")
     parser.add_argument("--queries", type=int)
     parser.add_argument("--results-per-query", type=int)
     parser.add_argument("--output-dir", default="output/newsletters")
     args = parser.parse_args()
 
-    brief = args.brief or input("Newsletter brief: ").strip()
+    brief = clean_text(args.brief or input("Newsletter brief: "))
     if not brief:
-        raise ValueError("A newsletter brief is required")
+        raise SystemExit("A newsletter brief is required.")
 
-    initialize_model_runtime(args.device_class)
-
-    depth = args.depth or prompt_for_depth()
-    explanation_style, custom_style_instructions = resolve_explanation_style(
+    explanation_style, custom_style = resolve_explanation_style(
         args.explanation_style,
         args.style_instructions,
     )
-    settings = build_research_settings(depth, args.queries, args.results_per_query)
-
-    run_newsletter_pipeline(
+    settings = build_research_settings(args.depth, args.queries, args.results_per_query)
+    initialize_model_runtime(args.device_class)
+    result = run_newsletter_pipeline(
         brief=brief,
         days=args.days,
-        depth=depth,
+        depth=args.depth,
         explanation_style=explanation_style,
-        custom_style_instructions=custom_style_instructions,
+        custom_style_instructions=custom_style,
         settings=settings,
         output_dir=args.output_dir,
     )
+    print(f"Run complete: {result['title']}")
+    print(f"HTML: {result['output_files']['html_path']}")
+    print(f"Markdown: {result['output_files']['markdown_path']}")
+
+
+def detect_system_info():
+    memory_total_gb, memory_available_gb = detect_memory_gb()
+    system_name = platform.system()
+    machine = platform.machine()
+    hardware_model = ""
+    chip = ""
+    gpu_model = ""
+
+    if system_name == "Darwin":
+        hardware_model = read_sysctl_value("hw.model")
+        chip = read_sysctl_value("machdep.cpu.brand_string") or read_sysctl_value("machdep.cpu.brand_string")
+        if not chip and machine == "arm64":
+            chip = "Apple Silicon"
+        gpu_model = chip if chip.startswith("Apple") else chip
+
+    return {
+        "system_name": system_name,
+        "platform": platform.platform(),
+        "machine": machine,
+        "hardware_model": hardware_model,
+        "chip": chip,
+        "gpu_model": gpu_model,
+        "memory_total_gb": round(memory_total_gb, 2),
+        "memory_available_gb": round(memory_available_gb, 2),
+    }
+
+
+def detect_memory_gb():
+    gib = 1024 ** 3
+    try:
+        import psutil
+
+        stats = psutil.virtual_memory()
+        return stats.total / gib, stats.available / gib
+    except Exception:
+        pass
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+        total = (page_size * total_pages) / gib
+        return total, total
+    except Exception:
+        return 0.0, 0.0
+
+
+def read_sysctl_value(key):
+    try:
+        completed = subprocess.run(
+            ["sysctl", "-n", key],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return ""
+    return clean_text(completed.stdout)
+
+
+def choose_model_profile(system_info, device_class_override=None):
+    device_class = (device_class_override or DEVICE_CLASS_OVERRIDE or infer_device_class(system_info)).strip().lower()
+    slice_ratio = choose_slice_ratio(system_info, device_class)
+    runtime_backend = choose_runtime_backend(system_info)
+    model_path = normalize_model_reference(SLICE_MODEL_PATHS.get(slice_ratio, DEFAULT_MODEL_PATH))
+
+    return {
+        "device_class": device_class,
+        "runtime_backend": runtime_backend,
+        "slice_ratio": slice_ratio,
+        "slice_label": format_slice_label(slice_ratio),
+        "model_path": model_path,
+        "draft_model_path": "",
+        "lazy": True,
+        "num_draft_tokens": 0,
+    }
+
+
+def infer_device_class(system_info):
+    total = float(system_info.get("memory_total_gb", 0) or 0)
+    available = float(system_info.get("memory_available_gb", 0) or 0)
+    system_name = str(system_info.get("system_name", ""))
+    machine = str(system_info.get("machine", "")).lower()
+
+    if "iphone" in machine or "android" in machine:
+        return "midrange_phone"
+    if total >= 24 or available >= 18:
+        return "gaming_laptop"
+    if total >= 16:
+        return "midrange_laptop"
+    if system_name == "Darwin" and machine == "arm64":
+        return "macbook"
+    if total >= 8:
+        return "midrange_laptop"
+    return "midrange_phone"
+
+
+def choose_slice_ratio(system_info, device_class):
+    available = max(0.0, float(system_info.get("memory_available_gb", 0) or 0) - DEFAULT_RAM_RESERVE_GB)
+
+    if device_class in {"midrange_phone", "flagship_phone"}:
+        return 0.125 if available < 4 else 0.25
+    if device_class == "macbook":
+        if available < 3:
+            return 0.125
+        if available < 6:
+            return 0.25
+        return 0.50
+    if device_class == "midrange_laptop":
+        if available < 4:
+            return 0.25
+        if available < 8:
+            return 0.50
+        return 0.75
+    if device_class == "gaming_laptop":
+        if available < 6:
+            return 0.50
+        if available < 10:
+            return 0.75
+        return 1.00
+    return 0.25
+
+
+def format_slice_label(slice_ratio):
+    percentage = slice_ratio * 100
+    if float(percentage).is_integer():
+        return f"{int(percentage)}%"
+    return f"{percentage:.1f}%"
+
+
+def choose_runtime_backend(system_info):
+    system_name = str(system_info.get("system_name", ""))
+    machine = str(system_info.get("machine", "")).lower()
+    if system_name == "Darwin" and machine == "arm64":
+        return "mlx"
+    return "transformers"
+
+
+def normalize_model_reference(model_path):
+    value = str(model_path or "").strip()
+    if not value:
+        return ""
+
+    path_candidate = Path(os.path.expanduser(value))
+    if path_candidate.is_absolute() or value.startswith("."):
+        return str(path_candidate.resolve())
+
+    local_candidate = (Path(DEFAULT_MODEL_ROOT) / value).resolve()
+    if local_candidate.exists():
+        return str(local_candidate)
+
+    return value
+
+
+def is_local_model_reference(model_path):
+    value = str(model_path or "").strip()
+    if not value:
+        return False
+    if value.startswith("/") or value.startswith(".") or value.startswith("~"):
+        return True
+    return Path(value).exists()
 
 
 def initialize_model_runtime(device_class_override=None):
     global MODEL
     global TOKENIZER
     global MODEL_RUNTIME
-    global DEVICE_CLASS_OVERRIDE
-
-    if MODEL_RUNTIME is not None:
-        return MODEL_RUNTIME
-
-    if device_class_override:
-        DEVICE_CLASS_OVERRIDE = device_class_override
 
     system_info = detect_system_info()
-    runtime_profile = choose_model_profile(system_info, DEVICE_CLASS_OVERRIDE)
+    profile = choose_model_profile(system_info, device_class_override)
+    model_path = normalize_model_reference(profile["model_path"])
 
-    print(f"Using model slice: {runtime_profile['slice_label']}")
-    print(f"Using runtime backend: {runtime_profile['runtime_backend']}")
+    if (
+        MODEL_RUNTIME
+        and MODEL_RUNTIME.get("model_path") == model_path
+        and MODEL_RUNTIME.get("runtime_backend") == profile["runtime_backend"]
+    ):
+        return MODEL_RUNTIME
 
-    if runtime_profile["runtime_backend"] == "mlx":
-        backend_runtime = initialize_mlx_runtime(system_info, runtime_profile)
-    elif runtime_profile["runtime_backend"] == "transformers":
-        backend_runtime = initialize_transformers_runtime(runtime_profile)
-    else:
-        raise SystemExit(f"Unsupported runtime backend: {runtime_profile['runtime_backend']}")
+    if not is_local_model_reference(model_path):
+        raise SystemExit(f"Model reference must be local for Chronicle: {model_path}")
+    if not Path(model_path).exists():
+        raise SystemExit(f"Local model not found at {model_path}")
 
-    MODEL = backend_runtime["model"]
-    TOKENIZER = backend_runtime["tokenizer"]
-    MODEL_RUNTIME = {
-        "system_info": system_info,
-        "device_class": runtime_profile["device_class"],
-        "profile_name": runtime_profile["profile_name"],
-        "runtime_backend": runtime_profile["runtime_backend"],
-        "slice_ratio": runtime_profile["slice_ratio"],
-        "model_path": runtime_profile["model_path"],
-        "draft_model": backend_runtime.get("draft_model"),
-        "num_draft_tokens": backend_runtime.get("num_draft_tokens", 0),
-        "device": backend_runtime.get("device", "cpu"),
-        "generate_fn": backend_runtime.get("generate_fn"),
-    }
+    if profile["runtime_backend"] == "mlx":
+        MODEL_RUNTIME = initialize_mlx_runtime(model_path, profile)
+        return MODEL_RUNTIME
 
-    print("Newsletter agent ready.")
-    return MODEL_RUNTIME
+    if profile["runtime_backend"] == "transformers":
+        MODEL_RUNTIME = initialize_transformers_runtime(model_path, profile)
+        return MODEL_RUNTIME
+
+    raise SystemExit(f"Unsupported runtime backend: {profile['runtime_backend']}")
 
 
-def initialize_mlx_runtime(system_info, runtime_profile):
-    if not system_info["metal_supported"]:
-        raise SystemExit("No Metal-capable Apple device detected. The MLX runtime requires Metal support.")
+def initialize_mlx_runtime(model_path, profile):
+    global MODEL
+    global TOKENIZER
 
     try:
-        from mlx_lm import generate as mlx_generate, load as mlx_load
+        from mlx_lm import generate, load
     except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "Missing dependency: mlx_lm.\n"
-            "Run this script with the project virtual environment:\n"
-            "  gemma-env/bin/python newsletter_agent.py --brief \"Your newsletter brief\"\n"
-            "Or activate it first:\n"
-            "  source gemma-env/bin/activate"
-        ) from exc
+        raise SystemExit(f"Missing dependency: {exc.name}") from exc
 
-    print("Loading newsletter brain into RAM")
-    model_path = ensure_model_path_ready(runtime_profile["model_path"], "mlx")
-    model, tokenizer = mlx_load(
-        model_path,
-        lazy=runtime_profile["lazy"],
-    )
+    MODEL, TOKENIZER = load(model_path)
 
-    draft_model = None
-    if runtime_profile["draft_model_path"]:
-        try:
-            draft_model_path = normalize_model_reference(runtime_profile["draft_model_path"])
-            draft_model, _ = mlx_load(draft_model_path, lazy=True)
-            print(f"Loaded draft model: {draft_model_path}")
-        except Exception as exc:
-            print(f"Draft model load failed, continuing without it: {exc}")
+    def mlx_generate_fn(model, tokenizer, prompt, max_tokens, draft_model=None, num_draft_tokens=0):
+        kwargs = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+        }
+        if draft_model is not None and num_draft_tokens > 0:
+            kwargs["draft_model"] = draft_model
+            kwargs["num_draft_tokens"] = num_draft_tokens
+        return generate(model, tokenizer, **kwargs)
 
     return {
-        "model": model,
-        "tokenizer": tokenizer,
-        "draft_model": draft_model,
-        "num_draft_tokens": runtime_profile["num_draft_tokens"],
-        "device": "metal",
-        "generate_fn": mlx_generate,
+        **profile,
+        "model_path": model_path,
+        "generate_fn": mlx_generate_fn,
+        "draft_model": None,
+        "device": "mlx",
     }
 
 
-def initialize_transformers_runtime(runtime_profile):
+def initialize_transformers_runtime(model_path, profile):
+    global MODEL
+    global TOKENIZER
+
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "Missing dependency for portable runtime: transformers and torch.\n"
-            "Install them for your platform, then rerun the script.\n"
-            "You can also set NEWSLETTER_AGENT_MODEL_TRANSFORMERS to a local or hub model path."
-        ) from exc
+        raise SystemExit(f"Missing dependency: {exc.name}") from exc
 
-    device = choose_transformers_device(torch)
-    dtype = choose_transformers_dtype(torch, device)
-    print("Loading newsletter brain into RAM")
+    TOKENIZER = AutoTokenizer.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    MODEL = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=True,
+        torch_dtype="auto",
+    )
 
-    model_path = ensure_model_path_ready(runtime_profile["model_path"], "transformers")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model_kwargs = {}
-    if dtype is not None:
-        model_kwargs["torch_dtype"] = dtype
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            low_cpu_mem_usage=True,
-            **model_kwargs,
-        )
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_kwargs,
-        )
+    MODEL = MODEL.to(device)
+    MODEL.eval()
 
-    model.eval()
-    if device != "cpu":
-        model = model.to(device)
-
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
+    if TOKENIZER.pad_token_id is None and TOKENIZER.eos_token_id is not None:
+        TOKENIZER.pad_token = TOKENIZER.eos_token
 
     return {
-        "model": model,
-        "tokenizer": tokenizer,
-        "draft_model": None,
-        "num_draft_tokens": 0,
+        **profile,
+        "model_path": model_path,
         "device": device,
     }
 
 
-def choose_transformers_device(torch):
-    if torch.cuda.is_available():
-        return "cuda"
+def describe_browser_model():
+    for candidate in DEFAULT_BROWSER_MODEL_CANDIDATES:
+        model_path = resolve_browser_model_location(candidate)
+        if model_path is None or not model_path.exists():
+            continue
 
-    mps_backend = getattr(torch.backends, "mps", None)
-    if mps_backend and mps_backend.is_available():
-        return "mps"
+        config = read_json_file(model_path / "config.json")
+        model_type = clean_text(config.get("model_type", "")) or "unknown"
+        architecture = clean_text(first_item(config.get("architectures")) or "")
+        onnx_root = model_path / "onnx"
+        preferred_precision, dtype_map = detect_browser_model_precision(onnx_root)
+        supports_slicing = model_type == "gemma3n"
+        model_id = derive_browser_model_id(candidate, model_path)
 
-    return "cpu"
-
-
-def choose_transformers_dtype(torch, device):
-    if device == "cuda":
-        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
-        return torch.float16
-    if device == "mps":
-        return torch.float16
-    return torch.float32
-
-
-def detect_system_info():
-    system_name = platform.system()
-    profiler_data = run_system_profiler(system_name)
-    hardware = profiler_data.get("SPHardwareDataType", [{}])
-    displays = profiler_data.get("SPDisplaysDataType", [{}])
-    hardware_info = hardware[0] if hardware else {}
-    display_info = displays[0] if displays else {}
-
-    gpu_info = detect_gpu_info(system_name, display_info)
-    memory_total_gb = detect_total_memory_gb(system_name, hardware_info)
-    memory_available_gb = detect_available_memory_gb(system_name)
-    is_android = bool(os.environ.get("ANDROID_ROOT") or os.environ.get("TERMUX_VERSION"))
-    is_ios = sys.platform == "ios"
-    chip = hardware_info.get("chip_type", "")
-    machine = platform.machine()
-    is_apple_silicon = system_name == "Darwin" and (
-        machine == "arm64" or str(chip).startswith("Apple ")
-    )
-    metal_supported = (
-        display_info.get("spdisplays_metal") == "spdisplays_supported" or is_apple_silicon
-    )
-
-    return {
-        "system_name": system_name,
-        "platform": platform.platform(),
-        "machine": machine,
-        "chip": chip,
-        "hardware_model": hardware_info.get("machine_model", ""),
-        "gpu_model": gpu_info["model"],
-        "gpu_vendor": gpu_info["vendor"],
-        "gpu_memory_gb": gpu_info["memory_gb"],
-        "dedicated_gpu": gpu_info["dedicated"],
-        "gpu_cores": display_info.get("sppci_cores", ""),
-        "metal_supported": metal_supported,
-        "is_apple_silicon": is_apple_silicon,
-        "is_android": is_android,
-        "is_ios": is_ios,
-        "is_mobile": is_android or is_ios,
-        "memory_total_gb": memory_total_gb,
-        "memory_available_gb": memory_available_gb,
-    }
-
-
-def run_system_profiler(system_name):
-    if system_name != "Darwin":
-        return {}
-
-    try:
-        result = subprocess.run(
-            ["system_profiler", "SPHardwareDataType", "SPDisplaysDataType", "-json"],
-            capture_output=True,
-            text=True,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            check=True,
-        )
-        return json.loads(result.stdout)
-    except Exception:
-        return {}
-
-
-def detect_gpu_info(system_name, display_info):
-    if system_name == "Darwin":
         return {
-            "model": str(display_info.get("sppci_model", "")),
-            "vendor": "apple",
-            "memory_gb": 0.0,
-            "dedicated": False,
+            "ready": True,
+            "model_id": model_id,
+            "model_path": str(model_path.resolve()),
+            "model_type": model_type,
+            "architecture": architecture,
+            "supports_slicing": supports_slicing,
+            "max_slices": 8 if supports_slicing else 1,
+            "preferred_precision": preferred_precision,
+            "dtype_map": dtype_map,
+            "display_name": derive_browser_display_name(model_id, architecture, model_type),
         }
 
-    nvidia_info = detect_nvidia_gpu()
-    if nvidia_info:
-        return nvidia_info
-
-    pci_hint = detect_pci_gpu_hint()
-    if pci_hint:
-        return pci_hint
-
+    fallback_id = DEFAULT_BROWSER_MODEL_CANDIDATES[0] if DEFAULT_BROWSER_MODEL_CANDIDATES else ""
     return {
-        "model": "",
-        "vendor": "",
-        "memory_gb": 0.0,
-        "dedicated": False,
-    }
-
-
-def detect_nvidia_gpu():
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            check=True,
-        )
-    except Exception:
-        return None
-
-    line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-    if not line:
-        return None
-
-    parts = [part.strip() for part in line.split(",")]
-    memory_gb = (float(parts[1]) / 1024.0) if len(parts) > 1 else 0.0
-    return {
-        "model": parts[0],
-        "vendor": "nvidia",
-        "memory_gb": memory_gb,
-        "dedicated": True,
-    }
-
-
-def detect_pci_gpu_hint():
-    try:
-        result = subprocess.run(
-            ["lspci"],
-            capture_output=True,
-            text=True,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            check=True,
-        )
-    except Exception:
-        return None
-
-    output = result.stdout.lower()
-    keywords = ("nvidia", "geforce", "rtx", "gtx", "radeon", "amd")
-    if not any(keyword in output for keyword in keywords):
-        return None
-
-    return {
-        "model": "discrete-gpu",
-        "vendor": "nvidia/amd",
-        "memory_gb": 0.0,
-        "dedicated": True,
-    }
-
-
-def detect_total_memory_gb(system_name, hardware_info):
-    memory_text = str(hardware_info.get("physical_memory", "")).strip()
-    if memory_text:
-        match = re.match(r"([0-9.]+)\s*GB", memory_text, re.IGNORECASE)
-        if match:
-            return float(match.group(1))
-
-    if system_name in {"Linux", "Android"} or os.environ.get("ANDROID_ROOT"):
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("MemTotal:"):
-                        kilobytes = int(line.split()[1])
-                        return kilobytes / (1024**2)
-        except Exception:
-            pass
-
-    if system_name == "Windows":
-        try:
-            import ctypes
-
-            class MemoryStatus(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            memory_status = MemoryStatus()
-            memory_status.dwLength = ctypes.sizeof(MemoryStatus)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status))
-            return memory_status.ullTotalPhys / (1024**3)
-        except Exception:
-            pass
-
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        total_pages = os.sysconf("SC_PHYS_PAGES")
-        return (page_size * total_pages) / (1024**3)
-    except Exception:
-        return 0.0
-
-
-def detect_available_memory_gb(system_name):
-    if system_name in {"Linux", "Android"} or os.environ.get("ANDROID_ROOT"):
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("MemAvailable:"):
-                        kilobytes = int(line.split()[1])
-                        return kilobytes / (1024**2)
-        except Exception:
-            pass
-
-    if system_name == "Windows":
-        try:
-            import ctypes
-
-            class MemoryStatus(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            memory_status = MemoryStatus()
-            memory_status.dwLength = ctypes.sizeof(MemoryStatus)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status))
-            return memory_status.ullAvailPhys / (1024**3)
-        except Exception:
-            pass
-
-    try:
-        result = subprocess.run(
-            ["vm_stat"],
-            capture_output=True,
-            text=True,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            check=True,
-        )
-    except Exception:
-        return 0.0
-
-    page_size_match = re.search(r"page size of (\d+) bytes", result.stdout)
-    page_size = int(page_size_match.group(1)) if page_size_match else 4096
-    page_counts = {}
-
-    for line in result.stdout.splitlines():
-        match = re.match(r"([^:]+):\s+([0-9]+)\.", line.strip())
-        if match:
-            page_counts[match.group(1)] = int(match.group(2))
-
-    available_pages = (
-        page_counts.get("Pages free", 0)
-        + page_counts.get("Pages inactive", 0)
-        + page_counts.get("Pages speculative", 0)
-        + page_counts.get("Pages purgeable", 0)
-    )
-    return (available_pages * page_size) / (1024**3)
-
-
-def choose_model_profile(system_info, device_class_override=None):
-    device_class = detect_device_class(system_info, device_class_override)
-    slice_ratio = choose_slice_ratio(device_class, system_info)
-    runtime_backend = choose_runtime_backend(system_info)
-
-    if slice_ratio <= 0.25:
-        profile_name = "constrained"
-    elif slice_ratio >= 0.75:
-        profile_name = "expanded"
-    else:
-        profile_name = "balanced"
-
-    profile = dict(MODEL_PROFILES[profile_name])
-    profile["profile_name"] = profile_name
-    profile["device_class"] = device_class
-    profile["runtime_backend"] = runtime_backend
-    profile["slice_ratio"] = slice_ratio
-    profile["slice_label"] = format_slice_label(slice_ratio)
-    profile["model_path"] = resolve_model_path_for_backend(
-        choose_model_path_for_slice(slice_ratio, profile["model_path"]),
-        runtime_backend,
-    )
-    if runtime_backend != "mlx":
-        profile["draft_model_path"] = ""
-        profile["num_draft_tokens"] = 0
-    return profile
-
-
-def detect_device_class(system_info, device_class_override=None):
-    override = device_class_override or DEVICE_CLASS_OVERRIDE
-    if override:
-        return override
-
-    total_gb = system_info["memory_total_gb"]
-    if system_info["is_mobile"]:
-        return "flagship_phone" if total_gb >= 8 else "midrange_phone"
-
-    if system_info["system_name"] == "Darwin":
-        return "macbook"
-
-    if system_info["dedicated_gpu"] or system_info["gpu_memory_gb"] >= 6 or total_gb >= 24:
-        return "gaming_laptop"
-
-    return "midrange_laptop"
-
-
-def choose_slice_ratio(device_class, system_info):
-    available_gb = system_info.get("memory_available_gb", 0.0) or 0.0
-    total_gb = system_info.get("memory_total_gb", 0.0) or 0.0
-    reserve_gb = max(DEFAULT_RAM_RESERVE_GB, total_gb * 0.35, 1.0)
-    headroom_gb = max(available_gb - reserve_gb, 0.0) if available_gb else 0.0
-
-    if not available_gb:
-        return 0.25
-    if headroom_gb <= 2:
-        return 0.125
-    if headroom_gb <= 5:
-        return 0.25
-    if headroom_gb <= 9:
-        return 0.50
-    if headroom_gb <= 14:
-        return 0.75
-    return 1.00
-
-
-def choose_runtime_backend(system_info):
-    override = os.environ.get("NEWSLETTER_AGENT_BACKEND", "").strip().lower()
-    if override in {"mlx", "transformers"}:
-        return override
-
-    if (
-        system_info["system_name"] == "Darwin"
-        and not system_info.get("is_ios")
-        and (system_info["metal_supported"] or system_info.get("is_apple_silicon"))
-    ):
-        return "mlx"
-    return "transformers"
-
-
-def choose_model_path_for_slice(slice_ratio, default_path):
-    rounded_ratio = round(slice_ratio, 3)
-    return SLICE_MODEL_PATHS.get(rounded_ratio, default_path)
-
-
-def resolve_model_path_for_backend(model_path, runtime_backend):
-    normalized_model_path = normalize_model_reference(model_path)
-
-    if runtime_backend == "mlx":
-        return normalized_model_path
-
-    if str(model_path).startswith("mlx-community/"):
-        return normalize_model_reference(DEFAULT_TRANSFORMERS_MODEL_PATH)
-
-    if normalized_model_path == normalize_model_reference(DEFAULT_LOCAL_MLX_MODEL_PATH):
-        return normalize_model_reference(DEFAULT_TRANSFORMERS_MODEL_PATH)
-
-    return normalized_model_path
-
-
-def normalize_model_reference(model_path):
-    model_path = str(model_path).strip()
-    if not model_path:
-        return model_path
-
-    if is_local_model_reference(model_path):
-        expanded_path = os.path.expanduser(model_path)
-        if os.path.isabs(expanded_path):
-            return os.path.normpath(expanded_path)
-        return os.path.normpath(os.path.join(PROJECT_ROOT, expanded_path))
-
-    return model_path
-
-
-def is_local_model_reference(model_path):
-    model_path = str(model_path).strip()
-    if not model_path:
-        return False
-
-    expanded_path = os.path.expanduser(model_path)
-    normalized_path = model_path.replace("\\", "/")
-    if os.path.isabs(expanded_path):
-        return True
-    if normalized_path.startswith(("./", "../", "~/", "models/")):
-        return True
-    return os.path.exists(os.path.join(PROJECT_ROOT, expanded_path))
-
-
-def ensure_model_path_ready(model_path, runtime_backend):
-    normalized_model_path = normalize_model_reference(model_path)
-    if not is_local_model_reference(normalized_model_path):
-        return normalized_model_path
-
-    if os.path.exists(normalized_model_path):
-        return normalized_model_path
-
-    raise SystemExit(build_missing_local_model_message(runtime_backend, normalized_model_path))
-
-
-def build_missing_local_model_message(runtime_backend, model_path):
-    if runtime_backend == "mlx":
-        expected_default_path = DEFAULT_LOCAL_MLX_MODEL_PATH
-        default_repo = DEFAULT_MLX_MODEL_REPO
-        override_hint = "NEWSLETTER_AGENT_MODEL or NEWSLETTER_AGENT_MODEL_SLICE_*"
-    else:
-        expected_default_path = DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH
-        default_repo = DEFAULT_TRANSFORMERS_MODEL_REPO
-        override_hint = "NEWSLETTER_AGENT_MODEL_TRANSFORMERS or NEWSLETTER_AGENT_MODEL"
-
-    return (
-        "Local model files not found.\n"
-        f"Expected model directory: {model_path}\n"
-        "This project now defaults to local model directories so end users do not need "
-        "Hugging Face tokens.\n"
-        "To fix this:\n"
-        f"  1. Place the model files at: {expected_default_path}\n"
-        f"  2. Or point {override_hint} to a local model directory\n"
-        f"  3. If you intentionally want Hugging Face downloads, set the override to a hub "
-        f"model id such as {default_repo} after authenticating for gated access"
-    )
-
-
-def describe_browser_model():
-    missing_descriptor = None
-
-    for candidate in DEFAULT_BROWSER_MODEL_CANDIDATES:
-        descriptor = build_browser_model_descriptor(candidate)
-        if descriptor["ready"]:
-            return descriptor
-        if missing_descriptor is None:
-            missing_descriptor = descriptor
-
-    return missing_descriptor or {
         "ready": False,
-        "model_id": "",
+        "model_id": fallback_id,
         "model_path": "",
         "model_type": "",
         "architecture": "",
         "supports_slicing": False,
         "max_slices": 1,
-        "display_name": "No local browser model found",
+        "preferred_precision": "",
+        "dtype_map": {},
+        "display_name": derive_browser_display_name(fallback_id, "", ""),
     }
 
 
-def build_browser_model_descriptor(model_reference):
-    normalized_reference = str(model_reference or "").strip().replace("\\", "/").strip("/")
-    model_path, model_id = resolve_browser_model_location(normalized_reference)
-    config_path = os.path.join(model_path, "config.json") if model_path else ""
-    config_data = {}
+def resolve_browser_model_location(candidate):
+    value = str(candidate or "").strip()
+    if not value:
+        return None
 
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as handle:
-                config_data = json.load(handle)
-        except Exception:
-            config_data = {}
+    raw_path = Path(os.path.expanduser(value))
+    if raw_path.is_absolute() or value.startswith("."):
+        return raw_path.resolve()
 
-    model_type = str(config_data.get("model_type") or "").strip()
-    architectures = config_data.get("architectures") or []
-    architecture = str(architectures[0]).strip() if architectures else ""
-    lower_hints = " ".join(
-        part
-        for part in (
-            normalized_reference.lower(),
-            model_type.lower(),
-            architecture.lower(),
-        )
-        if part
-    )
-    supports_slicing = "gemma3n" in lower_hints or "gemma-3n" in lower_hints
-    preferred_precision, dtype_map = detect_browser_model_precision(model_path)
-
-    display_name, model_variant = derive_browser_display_name(normalized_reference, model_type, architecture)
-
-    return {
-        "ready": bool(model_path and os.path.isdir(model_path) and os.path.exists(config_path)),
-        "model_id": model_id,
-        "model_path": model_path,
-        "model_type": model_type,
-        "architecture": architecture,
-        "model_variant": model_variant,
-        "supports_slicing": supports_slicing,
-        "max_slices": 8 if supports_slicing else 1,
-        "preferred_precision": preferred_precision,
-        "dtype_map": dtype_map,
-        "display_name": display_name,
-    }
+    return (Path(DEFAULT_MODEL_ROOT) / value).resolve()
 
 
-def derive_browser_display_name(model_reference, model_type, architecture):
-    lower_hints = " ".join(
-        part.lower()
-        for part in (model_reference, model_type, architecture)
-        if part
-    )
+def derive_browser_model_id(candidate, model_path):
+    value = str(candidate or "").strip()
+    if value and not value.startswith("/") and not value.startswith(".") and not value.startswith("~"):
+        return value
 
-    if "gemma-3n-e4b" in lower_hints:
-        return "Gemma 3n E4B adaptive", "E4B"
-    if "gemma-3n-e2b" in lower_hints:
-        return "Gemma 3n adaptive", "E2B"
-    if "gemma-3n" in lower_hints:
-        return "Gemma 3n adaptive", "3n"
-    if "gemma-3" in lower_hints:
-        return "Gemma 3", "3"
-
-    fallback_name = architecture or model_type or model_reference or "Local browser model"
-    return fallback_name, ""
+    try:
+        return model_path.resolve().relative_to(Path(DEFAULT_MODEL_ROOT).resolve()).as_posix()
+    except Exception:
+        return model_path.name
 
 
-def resolve_browser_model_location(model_reference):
-    if not model_reference:
-        return "", ""
-
-    model_root = os.path.abspath(DEFAULT_MODEL_ROOT)
-    expanded_reference = os.path.expanduser(model_reference)
-    if os.path.isabs(expanded_reference):
-        normalized_path = os.path.normpath(expanded_reference)
-        try:
-            model_id = os.path.relpath(normalized_path, model_root).replace("\\", "/")
-        except ValueError:
-            return normalized_path, ""
-        if model_id.startswith("../"):
-            return normalized_path, ""
-        return normalized_path, model_id
-
-    normalized_reference = expanded_reference.replace("\\", "/").strip("/")
-    if normalized_reference.startswith("models/"):
-        normalized_reference = normalized_reference.removeprefix("models/")
-
-    model_path = os.path.normpath(os.path.join(model_root, normalized_reference))
-    model_id = normalized_reference
-    return model_path, model_id
+def derive_browser_display_name(model_id, architecture, model_type):
+    lowered = f"{model_id} {architecture} {model_type}".lower()
+    if "gemma-3n" in lowered or "gemma3n" in lowered:
+        return "Gemma 3n adaptive"
+    if "gemma-3" in lowered or "gemma3" in lowered:
+        return "Gemma 3"
+    return clean_text(architecture or model_id or "Local model")
 
 
-def detect_browser_model_precision(model_path):
-    if not model_path:
+def detect_browser_model_precision(onnx_root):
+    if not onnx_root.exists():
         return "", {}
 
-    onnx_root = os.path.join(model_path, "onnx")
-    if not os.path.isdir(onnx_root):
-        return "", {}
-
-    decoder_precision_pairs = (
-        ("q4", "decoder_model_merged_q4.onnx", "embed_tokens_q4.onnx"),
-        ("q4f16", "decoder_model_merged_q4f16.onnx", "embed_tokens_q4f16.onnx"),
-        ("quantized", "decoder_model_merged_quantized.onnx", "embed_tokens_quantized.onnx"),
-        ("uint8", "decoder_model_merged_uint8.onnx", "embed_tokens_uint8.onnx"),
+    precision_order = ("q4", "q4f16", "uint8", "fp16", "fp32")
+    components = (
+        "decoder_model_merged",
+        "embed_tokens",
+        "audio_encoder",
+        "vision_encoder",
     )
     dtype_map = {}
-    preferred_precision = ""
 
-    for precision, decoder_name, embedding_name in decoder_precision_pairs:
-        if os.path.exists(os.path.join(onnx_root, decoder_name)) and os.path.exists(
-            os.path.join(onnx_root, embedding_name)
-        ):
-            preferred_precision = precision
-            dtype_map["decoder_model_merged"] = precision
-            dtype_map["embed_tokens"] = precision
-            break
+    for component in components:
+        precision = detect_onnx_component_precision(onnx_root, component, precision_order)
+        if precision:
+            dtype_map[component] = precision
 
-    auxiliary_component_precisions = {
-        "audio_encoder": ("q4f16", "q4", "int8", "uint8", "quantized", "fp16", "fp32"),
-        "vision_encoder": ("uint8", "int8", "quantized", "fp16", "fp32"),
-    }
-    for component_name, precision_order in auxiliary_component_precisions.items():
-        selected_precision = detect_onnx_component_precision(
-            onnx_root,
-            component_name,
-            precision_order,
-        )
-        if selected_precision:
-            dtype_map[component_name] = selected_precision
-
+    preferred_precision = dtype_map.get("decoder_model_merged") or next(iter(dtype_map.values()), "")
     return preferred_precision, dtype_map
 
 
@@ -943,189 +607,47 @@ def detect_onnx_component_precision(onnx_root, component_name, precision_order):
             filename = f"{component_name}.onnx"
         else:
             filename = f"{component_name}_{precision}.onnx"
-        if os.path.exists(os.path.join(onnx_root, filename)):
+        if (onnx_root / filename).exists():
             return precision
     return ""
-
-
-def format_slice_label(slice_ratio):
-    percentage = slice_ratio * 100
-    if percentage.is_integer():
-        return f"{int(percentage)}%"
-    return f"{percentage:.1f}%"
-
-
-def run_newsletter_pipeline(
-    brief,
-    days,
-    depth,
-    explanation_style,
-    custom_style_instructions,
-    settings,
-    output_dir,
-):
-    plan = build_research_plan(brief, days, settings["query_limit"], depth)
-    run_id = save_run(plan, brief, depth, explanation_style, custom_style_instructions)
-    market_snapshot = fetch_market_snapshot(brief)
-    research_budget_seconds = min(
-        int(settings.get("research_budget_seconds", 75)),
-        max(30, MAX_NEWSLETTER_RUNTIME_SECONDS - 120),
-    )
-    research_deadline = time.monotonic() + research_budget_seconds
-
-    print("\nPlanning complete.")
-    print(f"Title: {plan['title']}")
-    print(f"Research depth: {depth}")
-    print(f"Explanation style: {explanation_style}")
-    print(f"Research budget: {research_budget_seconds}s")
-    if market_snapshot:
-        print(f"Structured market data collected for {len(market_snapshot)} assets.")
-
-    collected_sources = []
-    research_budget_hit = False
-    for query in plan["queries"]:
-        if time.monotonic() >= research_deadline:
-            research_budget_hit = True
-            print("\nResearch budget reached. Drafting with the sources already collected.")
-            break
-
-        print(f"\nSearching: {query}")
-        results = search_web(query, settings["results_per_query"], deadline=research_deadline)
-        if not results:
-            print("  No search results collected for this query.")
-            continue
-        for rank, result in enumerate(results, start=1):
-            if time.monotonic() >= research_deadline:
-                research_budget_hit = True
-                print("  Research budget reached while processing results.")
-                break
-
-            article_text = fetch_article_text(result["url"], settings["article_chars"])
-            source_text = build_source_text(result, article_text)
-            if not source_text:
-                print("  Skipped source: no article text or search snippet available")
-                continue
-
-            source_record = {
-                "query": query,
-                "rank_index": rank,
-                "title": result["title"],
-                "url": result["url"],
-                "snippet": result["snippet"],
-                "article_text": article_text,
-                "source_summary": "",
-                "relevance_score": 0.0,
-            }
-            save_source(run_id, source_record)
-            collected_sources.append(source_record)
-            print(f"  Saved source: {result['title']}")
-
-        if research_budget_hit:
-            break
-
-    newsletter_markdown = compose_newsletter(
-        brief,
-        plan,
-        collected_sources,
-        days,
-        market_snapshot,
-        depth,
-        explanation_style,
-        custom_style_instructions,
-        settings["newsletter_tokens"],
-    )
-    output_files = write_newsletter_files(output_dir, plan["title"], newsletter_markdown)
-    update_run_output_path(run_id, output_files["html_path"])
-
-    print("\nNewsletter generated.")
-    print(f"Saved editable HTML to: {output_files['html_path']}")
-    print(f"Saved markdown source to: {output_files['markdown_path']}")
-    return {
-        "run_id": run_id,
-        "title": plan["title"],
-        "output_files": output_files,
-    }
 
 
 def build_research_settings(depth, query_limit_override, results_per_query_override):
     settings = dict(DEPTH_PRESETS[depth])
     if query_limit_override is not None:
-        settings["query_limit"] = query_limit_override
+        settings["query_limit"] = max(1, min(int(query_limit_override), 8))
     if results_per_query_override is not None:
-        settings["results_per_query"] = results_per_query_override
+        settings["results_per_query"] = max(1, min(int(results_per_query_override), 8))
     return settings
-
-
-def prompt_for_depth():
-    while True:
-        value = input("Research depth (low/medium/high) [medium]: ").strip().lower()
-        if not value:
-            return "medium"
-        if value in DEPTH_PRESETS:
-            return value
-        print("Please choose low, medium, or high.")
-
-
-def resolve_explanation_style(explanation_style, style_instructions):
-    style = explanation_style or prompt_for_explanation_style()
-    custom_instructions = ""
-
-    if style == "custom":
-        custom_instructions = (style_instructions or input("Custom style instructions: ").strip())
-        if not custom_instructions:
-            raise ValueError("Custom style instructions are required when explanation style is custom")
-    elif style_instructions:
-        custom_instructions = style_instructions.strip()
-
-    return style, custom_instructions
-
-
-def prompt_for_explanation_style():
-    while True:
-        value = input("Explanation style (concise/feynman/soc/custom) [concise]: ").strip().lower()
-        if not value:
-            return "concise"
-        if value in {"concise", "feynman", "soc", "custom"}:
-            return value
-        print("Please choose concise, feynman, soc, or custom.")
-
-
-def build_explanation_guidance(explanation_style, custom_style_instructions):
-    if explanation_style == "custom":
-        return custom_style_instructions.strip()
-    return EXPLANATION_STYLE_GUIDANCE[explanation_style]
-
-
-def build_research_plan(brief, days, query_limit, depth):
-    return build_fallback_research_plan(brief, days, query_limit, depth)
 
 
 def build_fallback_research_plan(brief, days, query_limit, depth):
     normalized_brief = clean_text(brief)
-    focus_phrase = derive_search_focus_phrase(normalized_brief)
-    keyword_variants = build_search_query_variants(focus_phrase or normalized_brief)
+    topic_profile = resolve_topic_profile(normalized_brief)
+    focus_phrase = topic_profile["search_focus"]
     query_candidates = [
-        normalized_brief,
+        topic_profile["canonical"],
         focus_phrase,
         f"{focus_phrase} news" if focus_phrase else "",
         f"{focus_phrase} latest" if focus_phrase else "",
         f"{focus_phrase} this week" if focus_phrase and days <= 10 else "",
         f"{focus_phrase} last {days} days" if focus_phrase and days > 10 else "",
         f"{focus_phrase} analysis" if focus_phrase else "",
-        *keyword_variants,
+        normalized_brief,
+        *build_search_query_variants(focus_phrase or normalized_brief),
     ]
 
     queries = []
     seen = set()
-    for query in query_candidates:
-        cleaned_query = clean_text(query)
-        if not cleaned_query:
+    for candidate in query_candidates:
+        value = clean_text(candidate)
+        if not value:
             continue
-        lowered = cleaned_query.lower()
+        lowered = value.lower()
         if lowered in seen:
             continue
         seen.add(lowered)
-        queries.append(cleaned_query)
+        queries.append(value)
         if len(queries) >= query_limit:
             break
 
@@ -1140,33 +662,33 @@ def build_fallback_research_plan(brief, days, query_limit, depth):
         "title": generate_fallback_title(normalized_brief),
         "audience": "General readers who want a useful weekly briefing",
         "tone": DEFAULT_WRITING_STYLE,
-        "queries": queries,
-        "sections": sections[: max(3, min(len(sections), 4 if depth == "high" else 3))],
+        "queries": queries or [normalized_brief],
+        "sections": sections[: max(3, 4 if depth == "high" else 3)],
     }
 
 
 def generate_fallback_title(brief):
-    focus_phrase = derive_search_focus_phrase(brief)
+    topic_profile = resolve_topic_profile(brief)
+    focus_phrase = topic_profile["title"] or topic_profile["canonical"] or derive_search_focus_phrase(brief)
     words = [word for word in re.split(r"\s+", focus_phrase or brief) if word]
     compact = " ".join(words[:4]).strip()
-    if not compact:
-        return "Weekly Newsletter"
-    return compact.title()
+    return compact.title() if compact else "Weekly Newsletter"
 
 
 def derive_search_focus_phrase(text):
+    topic_profile = resolve_topic_profile(text)
+    if topic_profile["canonical"] and topic_profile["canonical"].lower() != clean_text(text).lower():
+        return topic_profile["search_focus"]
     keywords = extract_search_keywords(text)
     if keywords:
         return " ".join(keywords[:4])
-    simplified = clean_text(
-        re.sub(
-            r"\b(what changed in|what changed|tell me about|show me|latest developments|key news|analysis and outlook)\b",
-            " ",
-            str(text or ""),
-            flags=re.IGNORECASE,
-        )
+    stripped = re.sub(
+        r"\b(what changed in|what changed|tell me about|show me|latest developments|key news|analysis and outlook)\b",
+        " ",
+        str(text or ""),
+        flags=re.IGNORECASE,
     )
-    return simplified
+    return clean_text(stripped)
 
 
 def extract_search_keywords(text):
@@ -1206,14 +728,14 @@ def build_search_query_variants(query):
     seen = set()
 
     def add(candidate):
-        text = clean_text(candidate)
-        if not text:
+        value = clean_text(candidate)
+        if not value:
             return
-        lowered = text.lower()
+        lowered = value.lower()
         if lowered in seen:
             return
         seen.add(lowered)
-        variants.append(text)
+        variants.append(value)
 
     add(original_query)
     add(simplified_query)
@@ -1226,6 +748,27 @@ def build_search_query_variants(query):
         add(f"{last_keyword} latest news")
 
     return variants[:5]
+
+
+def resolve_topic_profile(brief):
+    normalized_brief = clean_text(brief)
+    lowered = normalized_brief.lower()
+    keywords = extract_search_keywords(normalized_brief)
+    alias_key = lowered if lowered in TOPIC_ALIASES else (keywords[0] if len(keywords) == 1 and keywords[0] in TOPIC_ALIASES else "")
+    alias = TOPIC_ALIASES.get(alias_key, {})
+
+    canonical = clean_text(alias.get("canonical", "")) or normalized_brief
+    title = clean_text(alias.get("title", "")) or canonical
+    include_terms = tuple(alias.get("include_terms", ()) or tuple(keywords[:4]))
+    exclude_terms = tuple(alias.get("exclude_terms", ()))
+
+    return {
+        "canonical": canonical,
+        "title": title,
+        "search_focus": canonical,
+        "include_terms": include_terms,
+        "exclude_terms": exclude_terms,
+    }
 
 
 def fetch_market_snapshot(brief):
@@ -1257,12 +800,11 @@ def fetch_market_snapshot(brief):
                 "change_7d_pct": item.get("price_change_percentage_7d_in_currency"),
             }
         )
-
     return snapshot
 
 
 def looks_like_crypto_brief(brief):
-    lowered = brief.lower()
+    lowered = str(brief or "").lower()
     keywords = (
         "crypto",
         "bitcoin",
@@ -1288,26 +830,35 @@ def search_web(query, max_results, deadline=None):
         print(f"  Google search failed: {exc}")
         return []
 
+    results = prioritize_sources(results)
     print(f"  Google search: {len(results)} result(s)")
-    return prioritize_sources(results)[:max_results]
+    return results[:max_results]
 
 
 def search_google_news_rss(query, max_results):
     rss_query = urllib.parse.quote(f"{query} when:7d")
-    url = (
-        "https://news.google.com/rss/search?q="
-        f"{rss_query}&hl=en-US&gl=US&ceid=US:en"
-    )
+    url = f"https://news.google.com/rss/search?q={rss_query}&hl=en-US&gl=US&ceid=US:en"
     xml_text = fetch_url(url)
 
-    results = []
     root = ET.fromstring(xml_text)
+    results = []
+    seen = set()
+
     for item in root.findall(".//item"):
-        title = clean_text(item.findtext("title", ""))
+        title = clean_source_title(item.findtext("title", ""))
         url = clean_text(item.findtext("link", ""))
-        snippet = strip_tags(item.findtext("description", ""))
+        description = item.findtext("description", "") or ""
+        snippet = clean_text(strip_tags(description).replace("\xa0", " "))
+        if normalize_source_phrase(snippet) == normalize_source_phrase(title):
+            snippet = ""
+
         if not title or not url:
             continue
+
+        key = source_identity({"title": title, "url": url})
+        if key in seen:
+            continue
+        seen.add(key)
         results.append(
             {
                 "title": title,
@@ -1321,160 +872,43 @@ def search_google_news_rss(query, max_results):
     return results
 
 
-def is_indirect_source_url(url):
-    lowered = str(url or "").lower()
-    return "news.google.com/" in lowered
-
-
 def prioritize_sources(results):
-    return sorted(
+    seen = set()
+    prioritized = []
+    for result in sorted(
         results,
         key=lambda item: (
             1 if is_indirect_source_url(item.get("url", "")) else 0,
             -len(str(item.get("snippet", "") or "")),
         ),
-    )
-
-
-def search_duckduckgo_html(query, max_results):
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    html_text = fetch_url(url)
-
-    results = []
-    seen_urls = set()
-    link_matches = re.finditer(
-        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-        html_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    snippet_matches = iter(
-        re.findall(
-            r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|'
-            r'<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
-            html_text,
-            re.IGNORECASE | re.DOTALL,
-        )
-    )
-
-    for match in link_matches:
-        href, raw_title = match.groups()
-        resolved_url = normalize_result_url(html.unescape(href))
-        if not resolved_url or resolved_url in seen_urls:
+    ):
+        key = source_identity(result)
+        if key in seen:
             continue
-
-        title = clean_text(strip_tags(raw_title))
-        if not title:
-            continue
-
-        raw_snippet = ""
-        try:
-            snippet_groups = next(snippet_matches)
-            raw_snippet = next((group for group in snippet_groups if group), "")
-        except StopIteration:
-            raw_snippet = ""
-
-        seen_urls.add(resolved_url)
-        results.append(
-            {
-                "title": title,
-                "url": resolved_url,
-                "snippet": clean_text(strip_tags(html.unescape(raw_snippet))),
-            }
-        )
-        if len(results) >= max_results:
-            break
-
-    return results
+        seen.add(key)
+        prioritized.append(result)
+    return prioritized
 
 
-def search_duckduckgo_lite(query, max_results):
-    url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query)
-    html_text = fetch_url(url)
-
-    results = []
-    seen_urls = set()
-    for block in re.findall(r"<tr>.*?</tr>", html_text, re.IGNORECASE | re.DOTALL):
-        link_match = re.search(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
-        if not link_match:
-            continue
-
-        href, raw_title = link_match.groups()
-        resolved_url = normalize_result_url(html.unescape(href))
-        if not resolved_url or resolved_url in seen_urls:
-            continue
-
-        snippet_match = re.search(
-            r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>',
-            block,
-            re.IGNORECASE | re.DOTALL,
-        )
-        seen_urls.add(resolved_url)
-        results.append(
-            {
-                "title": clean_text(strip_tags(raw_title)),
-                "url": resolved_url,
-                "snippet": clean_text(strip_tags(snippet_match.group(1))) if snippet_match else "",
-            }
-        )
-        if len(results) >= max_results:
-            break
-
-    return results
+def source_identity(source):
+    title_key = normalize_source_phrase(clean_source_title(source.get("title", "")))
+    url = str(source.get("url", "") or "")
+    if "news.google.com/" in url.lower():
+        return f"title:{title_key}"
+    parsed = urllib.parse.urlparse(url)
+    return f"url:{parsed.netloc}{parsed.path}" if parsed.netloc else f"title:{title_key}"
 
 
-def search_bing_html(query, max_results):
-    url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
-    html_text = fetch_url(url)
-
-    results = []
-    seen_urls = set()
-    for block in re.findall(r'<li[^>]*class="b_algo"[^>]*>.*?</li>', html_text, re.IGNORECASE | re.DOTALL):
-        link_match = re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
-        if not link_match:
-            continue
-
-        href, raw_title = link_match.groups()
-        resolved_url = normalize_result_url(html.unescape(href))
-        if not resolved_url or resolved_url in seen_urls:
-            continue
-
-        snippet_match = re.search(r"<p>(.*?)</p>", block, re.IGNORECASE | re.DOTALL)
-        seen_urls.add(resolved_url)
-        results.append(
-            {
-                "title": clean_text(strip_tags(raw_title)),
-                "url": resolved_url,
-                "snippet": clean_text(strip_tags(snippet_match.group(1))) if snippet_match else "",
-            }
-        )
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
-def normalize_result_url(href):
-    if href.startswith("//"):
-        href = "https:" + href
-
-    if "duckduckgo.com/l/" in href:
-        parsed = urllib.parse.urlparse(href)
-        params = urllib.parse.parse_qs(parsed.query)
-        target = params.get("uddg", [""])[0]
-        return urllib.parse.unquote(target)
-
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-
-    return ""
-
-
-def strip_tags(value):
-    without_tags = re.sub(r"(?s)<[^>]+>", " ", str(value or ""))
-    return html.unescape(clean_text(without_tags))
+def is_indirect_source_url(url):
+    return "news.google.com/" in str(url or "").lower()
 
 
 def fetch_url(url):
+    body, _ = fetch_response(url)
+    return body
+
+
+def fetch_response(url):
     request = urllib.request.Request(
         url,
         headers={
@@ -1487,50 +921,69 @@ def fetch_url(url):
             "Cache-Control": "no-cache",
         },
     )
-    return read_response(request)
 
-
-def read_response(request):
     with urllib.request.urlopen(
         request,
         timeout=REQUEST_TIMEOUT_SECONDS,
         context=INSECURE_SSL_CONTEXT,
     ) as response:
-        return response.read().decode("utf-8", errors="ignore")
+        return response.read().decode("utf-8", errors="ignore"), response.geturl()
 
 
 def fetch_article_text(url, max_article_chars):
+    if not max_article_chars:
+        return ""
+
     try:
-        raw_html = fetch_url(url)
+        raw_html, final_url = fetch_response(url)
     except Exception as exc:
         print(f"  Article fetch failed for {url}: {exc}")
         return ""
 
-    text = raw_html
-    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
-    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
-    text = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    text = clean_text(text)
+    text = extract_article_text(raw_html)
+    if looks_like_placeholder_article_text(text):
+        if final_url and final_url != url:
+            try:
+                raw_html, _ = fetch_response(final_url)
+                text = extract_article_text(raw_html)
+            except Exception:
+                return ""
+
     if looks_like_placeholder_article_text(text):
         return ""
+
     return compact_evidence_text(text, max_article_chars)
 
 
-def build_source_text(result, article_text):
-    title = clean_text(result.get("title", ""))
-    snippet = clean_text(result.get("snippet", ""))
-    compact_article = compact_evidence_text(article_text, 360)
-    if compact_article:
-        return compact_article
+def extract_article_text(raw_html):
+    paragraph_matches = re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", raw_html or "")
+    paragraphs = []
+    for match in paragraph_matches:
+        cleaned = clean_text(strip_tags(match))
+        if len(cleaned) >= 40:
+            paragraphs.append(cleaned)
 
-    compact_snippet = compact_evidence_text(snippet, 220)
-    if compact_snippet:
-        normalized_title = normalize_source_phrase(title)
-        normalized_snippet = normalize_source_phrase(compact_snippet)
-        if normalized_snippet and normalized_snippet != normalized_title:
-            return compact_snippet
+    if paragraphs:
+        return " ".join(paragraphs[:8])
+
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", raw_html or "")
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", text)
+    text = re.sub(r"(?is)<svg.*?>.*?</svg>", " ", text)
+    text = strip_tags(text)
+    return clean_text(text)
+
+
+def build_source_text(result, article_text):
+    title = clean_source_title(result.get("title", ""))
+    snippet = clean_text(result.get("snippet", ""))
+    article_evidence = compact_evidence_text(article_text, 360)
+    if article_evidence:
+        return article_evidence
+
+    snippet_evidence = compact_evidence_text(snippet, 220)
+    if snippet_evidence and normalize_source_phrase(snippet_evidence) != normalize_source_phrase(title):
+        return snippet_evidence
 
     return title
 
@@ -1541,68 +994,53 @@ def looks_like_placeholder_article_text(text):
         return True
     if normalized in {"google news", "bing", "duckduckgo"}:
         return True
-    return len(normalized) < 120
+    if len(normalized) < 120:
+        return True
+    repeated = normalized.count("cookie")
+    return repeated >= 3
 
 
 def build_mode_system_prompt(explanation_style, custom_style_instructions):
-    """Return a compact, mode-specific system prompt."""
     base = (
         "You are Chronicle, a newsletter writer. "
-        "Think silently, form one strong argument from the research notes, and write clean markdown. "
+        "Think silently, form one clear argument from the research notes, and write clean markdown. "
         "Do not copy source wording. Do not use raw URLs in the body. Do not repeat sentences."
     )
 
     if explanation_style == "feynman":
         return (
             f"{base}\n\n"
-            "WRITING MODE — Feynman:\n"
-            "Explain every idea as if teaching an intelligent beginner. "
-            "Use plain language, clear causality, and concrete analogies. "
-            "Break down jargon without being condescending. "
-            "Make complexity feel intuitive."
+            "Mode: Feynman. Explain clearly in plain language, with simple causality and concrete examples."
         )
 
     if explanation_style == "soc":
         return (
             f"{base}\n\n"
-            "WRITING MODE — Socratic:\n"
-            "Structure the newsletter around questions and answers. "
-            "Open each section with a sharp question, then answer it with evidence. "
-            "Let each answer deepen the reader's understanding and lead naturally to the next question. "
-            "Keep it conversational and intellectually honest."
+            "Mode: Socratic. Structure sections as sharp questions followed by clear answers grounded in evidence."
         )
 
     if explanation_style == "custom" and custom_style_instructions:
         return (
             f"{base}\n\n"
-            f"WRITING MODE — Custom:\n"
-            f"Follow these instructions exactly: {custom_style_instructions}"
+            f"Mode: Custom. Follow these instructions exactly: {clean_text(custom_style_instructions)[:220]}"
         )
 
-    # Default: concise
     return (
         f"{base}\n\n"
-        "WRITING MODE — Concise:\n"
-        "Be tight, selective, and high-signal. Short paragraphs. No filler. "
-        "Prefer strong interpretation over padded recap. "
-        "Every sentence should earn its place."
+        "Mode: Concise. Be selective, high-signal, and analytical."
     )
 
 
 def build_source_block(collected_sources):
-    """Format compact research notes for the model prompt."""
     if not collected_sources:
         return "No web sources were collected."
 
     blocks = []
     for index, source in enumerate(collected_sources[:4], start=1):
-        title = clean_text(source.get("title", ""))
+        title = clean_source_title(source.get("title", ""))
         evidence = build_source_text(source, source.get("article_text", ""))
-        evidence = compact_evidence_text(evidence, 240)
-        if not evidence:
-            evidence = title
+        evidence = compact_evidence_text(evidence, 240) or title
         blocks.append(f"[{index}] {title}: {evidence}")
-
     return "\n\n".join(blocks)
 
 
@@ -1621,20 +1059,13 @@ def compose_newsletter(
     source_block = build_source_block(collected_sources)
     market_block = json.dumps(market_snapshot, ensure_ascii=True) if market_snapshot else "None."
     sections_block = " | ".join(plan["sections"][:3])
-    no_sources_note = ""
-    if not collected_sources:
-        no_sources_note = (
-            "\nIMPORTANT: No web sources were collected. "
-            "Write the newsletter based only on the brief and any market data. "
-            "Be explicit about what is unverified. Do not invent events, quotes, or citations."
-        )
 
     prompt = f"""<start_of_turn>user
 {system_prompt}
 
 Topic: {clean_text(brief)[:180]}
-Title: {clean_text(plan['title'])[:100]}
-Audience: {clean_text(plan['audience'])[:80]}
+Title: {clean_text(plan["title"])[:100]}
+Audience: {clean_text(plan["audience"])[:80]}
 Coverage window: last {days} days
 Depth: {depth}
 Section plan: {sections_block}
@@ -1644,20 +1075,17 @@ Research notes:
 
 Market data:
 {market_block}
-{no_sources_note}
 
 Instructions:
 - First identify the strongest through-line across the research notes
 - Then write 550 to 750 words
-- Start with one H1 title and a sharp opening paragraph
+- Start with one H1 title and a strong opening paragraph
 - Use H2 headings for the main sections
 - Synthesize the evidence into a coherent argument, not a list of summaries
 - Explain why the developments matter, not just what happened
-- Cite sources inline as [1], [2] etc.
-- If market data exists, cite as [M1] and use the actual numbers
-- End with a ## Sources section: [1]: Title - URL format
-- If market data was cited, add: [M1]: CoinGecko Markets API - https://www.coingecko.com/
-- Write only the markdown newsletter, nothing else
+- Cite sources inline as [1], [2] and use [M1] for market data if needed
+- Do not include a Sources section; Chronicle will add the reference list after writing
+- Write only the markdown newsletter
 <end_of_turn>
 <start_of_turn>model
 """
@@ -1665,81 +1093,226 @@ Instructions:
     return generate_text_from_prompt(prompt, newsletter_tokens).strip()
 
 
-def normalize_source_phrase(value):
-    normalized = re.sub(
-        r"\b(reuters|ap news|associated press|msn|aol\.com|yahoo!?\s*news|dw\.com|the new york times|al jazeera|national post|toronto star|britannica)\b",
-        " ",
-        str(value or "").lower(),
+def render_deterministic_newsletter(plan, brief, collected_sources, explanation_style, market_snapshot):
+    lead_sources = collected_sources[:3]
+    title = plan["title"]
+    sections = plan["sections"][:3]
+
+    if lead_sources:
+        lead_titles = [clean_source_title(source["title"]) for source in lead_sources[:2]]
+        opening = (
+            f"The clearest signal around {brief} is not any one isolated headline, "
+            f"but the way {lead_titles[0]}{' and ' + lead_titles[1] if len(lead_titles) > 1 else ''} "
+            "are pulling the story into a single frame."
+        )
+    else:
+        opening = (
+            f"External reporting on {brief} was thin in this run, so this issue stays close to the verified brief "
+            "and avoids overclaiming."
+        )
+
+    body = [f"# {title}", "", opening, ""]
+    for index, section in enumerate(sections):
+        body.append(f"## {section}")
+        body.append("")
+        paired_sources = lead_sources[index:index + 2] or lead_sources[:1]
+        if paired_sources:
+            lines = []
+            for source_index, source in enumerate(paired_sources, start=1):
+                evidence = build_source_text(source, source.get("article_text", ""))
+                citation = collected_sources.index(source) + 1
+                lines.append(f"{evidence} [{citation}]")
+            body.append(" ".join(lines))
+        else:
+            body.append(f"This section remains provisional because Chronicle did not collect enough usable evidence for {brief}.")
+        body.append("")
+
+    if market_snapshot:
+        top_asset = market_snapshot[0]
+        body.append("## Market context")
+        body.append("")
+        body.append(
+            f"{top_asset['name']} ({top_asset['symbol']}) is trading near {top_asset['price_usd']} USD, "
+            f"with 24h change of {top_asset['change_24h_pct']} and 7d change of {top_asset['change_7d_pct']} [M1]."
+        )
+        body.append("")
+
+    if explanation_style == "soc":
+        body.insert(4, "What is the real question here? It is whether the visible headlines add up to one durable direction or just a noisy burst.")
+        body.insert(5, "")
+    elif explanation_style == "feynman":
+        body.insert(4, "Think of the reporting window like a map: each headline is a pin, and the pattern matters more than any single pin.")
+        body.insert(5, "")
+
+    return "\n".join(body).strip()
+
+
+def finalize_newsletter_markdown(markdown, plan, collected_sources, market_snapshot):
+    text = normalize_newsletter_markdown(markdown)
+    if not text:
+        text = f"# {plan['title']}\n"
+    if not re.search(r"(?m)^#\s+", text):
+        text = f"# {plan['title']}\n\n{text}"
+    if not re.search(r"(?im)^##\s+sources\b", text):
+        text = f"{text.rstrip()}\n\n{build_sources_section(collected_sources, market_snapshot)}"
+    return text.strip()
+
+
+def build_sources_section(collected_sources, market_snapshot):
+    if collected_sources:
+        lines = []
+        for index, source in enumerate(collected_sources, start=1):
+            title = clean_source_title(source.get("title", ""))
+            url = clean_text(source.get("url", ""))
+            lines.append(f"[{index}]: {title} - {url}")
+    else:
+        lines = ["No external sources were successfully collected."]
+
+    if market_snapshot:
+        lines.append("[M1]: CoinGecko Markets API - https://www.coingecko.com/")
+
+    return "## Sources\n" + "\n".join(lines)
+
+
+def run_newsletter_pipeline(
+    brief,
+    days,
+    depth,
+    explanation_style,
+    custom_style_instructions,
+    settings,
+    output_dir,
+):
+    plan = build_fallback_research_plan(brief, days, settings["query_limit"], depth)
+    run_id = save_run(plan, brief, depth, explanation_style, custom_style_instructions)
+    market_snapshot = fetch_market_snapshot(brief)
+
+    research_budget_seconds = min(
+        int(settings.get("research_budget_seconds", 45)),
+        max(30, MAX_NEWSLETTER_RUNTIME_SECONDS - 120),
     )
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return clean_text(normalized)
+    research_deadline = time.monotonic() + research_budget_seconds
+    article_fetches = 0
+    max_article_fetches = max(2, min(6, settings["query_limit"] + 1))
+    collected_sources = []
+    seen_source_keys = set()
 
+    print("Planning complete.")
+    print(f"Title: {plan['title']}")
+    print(f"Research depth: {depth}")
+    print(f"Explanation style: {explanation_style}")
+    print(f"Research budget: {research_budget_seconds}s")
+    if market_snapshot:
+        print(f"Structured market data collected for {len(market_snapshot)} assets.")
 
-def compact_evidence_text(text, max_chars):
-    value = clean_text(text or "")
-    if not value:
-        return ""
-
-    value = re.sub(r"\b(title|url|evidence)\s*:\s*", " ", value, flags=re.IGNORECASE)
-    value = re.sub(r"https?://\S+", " ", value, flags=re.IGNORECASE)
-    value = clean_text(value)
-    if not value:
-        return ""
-
-    sentences = re.split(r"(?<=[.!?])\s+", value)
-    selected = []
-    seen = set()
-    total_length = 0
-    for sentence in sentences:
-        cleaned_sentence = clean_text(sentence)
-        if len(cleaned_sentence) < 25:
-            continue
-        key = re.sub(r"[^a-z0-9]+", " ", cleaned_sentence.lower()).strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        selected.append(cleaned_sentence)
-        total_length += len(cleaned_sentence) + 1
-        if total_length >= max_chars:
+    for query in plan["queries"]:
+        if time.monotonic() >= research_deadline:
+            print("Research budget reached. Drafting with the material already collected.")
             break
 
-    if not selected:
-        fallback = value[:max_chars].rsplit(" ", 1)[0].strip()
-        return fallback or value[:max_chars].strip()
+        print(f"Searching: {query}")
+        results = search_web(query, settings["results_per_query"], deadline=research_deadline)
+        print(f"  Search results: {len(results)}")
 
-    compact = clean_text(" ".join(selected))
-    if len(compact) <= max_chars:
-        return compact
+        for rank_index, result in enumerate(results, start=1):
+            if time.monotonic() >= research_deadline:
+                print("  Research budget reached while processing results.")
+                break
 
-    trimmed = compact[:max_chars].rsplit(" ", 1)[0].strip()
-    return trimmed or compact[:max_chars].strip()
+            key = source_identity(result)
+            if key in seen_source_keys:
+                continue
+
+            article_text = ""
+            should_fetch_article = (
+                settings.get("article_chars", 0) > 0
+                and article_fetches < max_article_fetches
+                and rank_index <= 2
+            )
+            if should_fetch_article:
+                print("  Fetching article text for richer evidence…")
+                article_text = fetch_article_text(result["url"], settings["article_chars"])
+                if article_text:
+                    article_fetches += 1
+                    print(f"  Article text captured: {len(article_text)} chars")
+                else:
+                    print("  Article fetch did not yield usable text. Falling back to snippet evidence.")
+
+            source_text = build_source_text(result, article_text)
+            if not source_text:
+                print("  Skipped source: no article text or search snippet available.")
+                continue
+
+            seen_source_keys.add(key)
+            record = {
+                "query": query,
+                "rank_index": rank_index,
+                "title": clean_source_title(result["title"]),
+                "url": result["url"],
+                "snippet": clean_text(result.get("snippet", "")),
+                "article_text": article_text,
+                "source_summary": source_text,
+                "source_text": source_text,
+                "relevance_score": rank_source(result, article_text, rank_index),
+            }
+            save_source(run_id, record)
+            collected_sources.append(record)
+            print(f"  Source ready: {record['title']}")
+
+    try:
+        newsletter_markdown = compose_newsletter(
+            brief,
+            plan,
+            collected_sources,
+            days,
+            market_snapshot,
+            depth,
+            explanation_style,
+            custom_style_instructions,
+            settings["newsletter_tokens"],
+        )
+    except Exception as exc:
+        print(f"Model drafting failed: {exc}")
+        newsletter_markdown = render_deterministic_newsletter(
+            plan,
+            brief,
+            collected_sources,
+            explanation_style,
+            market_snapshot,
+        )
+
+    newsletter_markdown = finalize_newsletter_markdown(
+        newsletter_markdown,
+        plan,
+        collected_sources,
+        market_snapshot,
+    )
+    output_files = write_newsletter_files(output_dir, plan["title"], newsletter_markdown)
+    update_run_output_path(run_id, output_files["html_path"])
+
+    print("Newsletter generated.")
+    print(f"Saved editable HTML to: {output_files['html_path']}")
+    print(f"Saved markdown source to: {output_files['markdown_path']}")
+
+    return {
+        "run_id": run_id,
+        "title": plan["title"],
+        "output_files": output_files,
+    }
 
 
-
-
-def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):
-    response = generate_with_runtime(prompt, max_tokens)
-    parsed = try_parse_model_json(response, prefill)
-    if parsed is not None:
-        return parsed
-
-    last_response = response
-    for _ in range(retries):
-        repair_prompt = build_json_repair_prompt(last_response, prefill, schema_hint)
-        repaired_response = generate_text_from_prompt(repair_prompt, max_tokens)
-        parsed = try_parse_model_json(repaired_response, "")
-        if parsed is not None:
-            return parsed
-        last_response = repaired_response
-
-    raise ValueError("Model did not return valid JSON")
+def rank_source(result, article_text, rank_index):
+    score = 10.0 - (rank_index * 0.5)
+    if article_text:
+        score += min(3.0, len(article_text) / 400.0)
+    if result.get("snippet"):
+        score += 1.0
+    if is_indirect_source_url(result.get("url", "")):
+        score -= 0.5
+    return round(score, 2)
 
 
 def generate_text_from_prompt(prompt, max_tokens):
-    return generate_with_runtime(prompt, max_tokens).strip()
-
-
-def generate_with_runtime(prompt, max_tokens):
     runtime = initialize_model_runtime()
 
     if runtime["runtime_backend"] == "mlx":
@@ -1748,8 +1321,8 @@ def generate_with_runtime(prompt, max_tokens):
             TOKENIZER,
             prompt=prompt,
             max_tokens=max_tokens,
-            draft_model=runtime["draft_model"],
-            num_draft_tokens=runtime["num_draft_tokens"],
+            draft_model=runtime.get("draft_model"),
+            num_draft_tokens=runtime.get("num_draft_tokens", 0),
         ).strip()
 
     if runtime["runtime_backend"] == "transformers":
@@ -1765,15 +1338,14 @@ def generate_with_transformers(prompt, max_tokens, runtime):
     device = runtime.get("device", "cpu")
     encoded = {key: value.to(device) for key, value in encoded.items()}
     input_length = encoded["input_ids"].shape[-1]
-    pad_token_id = TOKENIZER.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = TOKENIZER.eos_token_id
+    pad_token_id = TOKENIZER.pad_token_id or TOKENIZER.eos_token_id
 
     with torch.no_grad():
         output = MODEL.generate(
             **encoded,
             max_new_tokens=max_tokens,
             do_sample=False,
+            repetition_penalty=1.12,
             pad_token_id=pad_token_id,
         )
 
@@ -1781,103 +1353,8 @@ def generate_with_transformers(prompt, max_tokens, runtime):
     return TOKENIZER.decode(generated, skip_special_tokens=True).strip()
 
 
-def try_parse_model_json(response_text, prefill):
-    candidates = []
-    stripped = strip_code_fences(response_text.strip())
-    if prefill:
-        candidates.append(prefill + stripped)
-    candidates.append(stripped)
-
-    for candidate in candidates:
-        parsed = try_parse_json_candidate(candidate)
-        if parsed is not None:
-            return parsed
-
-    return None
-
-
-def try_parse_json_candidate(text):
-    clean_text_value = "".join(char for char in text if ord(char) >= 32)
-
-    try:
-        return json.loads(clean_text_value)
-    except json.JSONDecodeError:
-        pass
-
-    extracted = extract_json_object(clean_text_value)
-    if not extracted:
-        return None
-
-    try:
-        return json.loads(extracted)
-    except json.JSONDecodeError:
-        return None
-
-
-def extract_json_object(text):
-    start = text.find("{")
-    if start == -1:
-        return ""
-
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-
-    return ""
-
-
-def strip_code_fences(text):
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    return stripped.strip()
-
-
-def build_json_repair_prompt(response_text, prefill, schema_hint):
-    expected_shape = schema_hint or "Return one valid JSON object."
-    prompt = f"""<start_of_turn>user
-Convert the following model output into one valid JSON object.
-
-Expected JSON shape:
-{expected_shape}
-
-Original output:
-\"\"\"
-{prefill}{response_text.strip()}
-\"\"\"
-
-Rules:
-- return valid JSON only
-- do not include markdown fences
-- do not include explanations
-<end_of_turn>
-<start_of_turn>model
-"""
-    return prompt
-
-
 def save_run(plan, brief, depth, explanation_style, custom_style_instructions):
+    initialize_database()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -1914,6 +1391,7 @@ def save_run(plan, brief, depth, explanation_style, custom_style_instructions):
 
 
 def save_source(run_id, source_record):
+    initialize_database()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -1933,14 +1411,14 @@ def save_source(run_id, source_record):
         """,
         (
             run_id,
-            source_record["query"],
-            source_record["rank_index"],
-            source_record["title"],
-            source_record["url"],
-            source_record["snippet"],
-            source_record["article_text"],
-            source_record["source_summary"],
-            source_record["relevance_score"],
+            clean_text(source_record.get("query", "")),
+            int(source_record.get("rank_index", 0) or 0),
+            clean_text(source_record.get("title", "")) or "Untitled source",
+            clean_text(source_record.get("url", "")),
+            clean_text(source_record.get("snippet", "")),
+            clean_text(source_record.get("article_text", "")),
+            clean_text(source_record.get("source_summary", "")),
+            float(source_record.get("relevance_score", 0.0) or 0.0),
         ),
     )
     conn.commit()
@@ -1948,55 +1426,62 @@ def save_source(run_id, source_record):
 
 
 def update_run_output_path(run_id, output_path):
+    initialize_database()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE newsletter_runs SET output_path = ? WHERE id = ?",
-        (output_path, run_id),
+        (str(output_path or ""), run_id),
     )
     conn.commit()
     conn.close()
 
 
 def write_newsletter_files(output_dir, title, markdown):
-    os.makedirs(output_dir, exist_ok=True)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
     created_at = datetime.now()
     timestamp = created_at.strftime("%Y%m%d_%H%M%S")
     slug = slugify(title)
+
     normalized_markdown = normalize_newsletter_markdown(markdown)
-    markdown_path = os.path.join(output_dir, f"{timestamp}_{slug}.md")
-    html_path = os.path.join(output_dir, f"{timestamp}_{slug}.html")
+    markdown_path = output_root / f"{timestamp}_{slug}.md"
+    html_path = output_root / f"{timestamp}_{slug}.html"
 
-    with open(markdown_path, "w", encoding="utf-8") as handle:
-        handle.write(normalized_markdown + "\n")
-
-    editable_html = render_editable_newsletter_html(title, normalized_markdown, created_at)
-    with open(html_path, "w", encoding="utf-8") as handle:
-        handle.write(editable_html)
+    markdown_path.write_text(normalized_markdown + "\n", encoding="utf-8")
+    html_path.write_text(
+        render_editable_newsletter_html(title, normalized_markdown, created_at),
+        encoding="utf-8",
+    )
 
     return {
-        "markdown_path": markdown_path,
-        "html_path": html_path,
+        "markdown_path": str(markdown_path.resolve()),
+        "html_path": str(html_path.resolve()),
     }
 
 
 def normalize_newsletter_markdown(markdown):
-    normalized = strip_code_fences(str(markdown or "")).replace("\r\n", "\n").strip()
-    return normalized
+    text = strip_code_fences(str(markdown or "")).replace("\r\n", "\n").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def strip_code_fences(text):
+    stripped = str(text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
 
 
 def render_editable_newsletter_html(fallback_title, markdown, created_at):
-    document = parse_newsletter_markdown(markdown, fallback_title)
-    display_title = document["title"] or fallback_title or "Newsletter"
-    standfirst = document["standfirst"] or "Add an opening note that frames the issue with conviction."
-    body_html = render_newsletter_body_html(document["blocks"])
-    sources_html = render_sources_html(document["sources"])
+    title = extract_title_from_markdown(markdown, fallback_title)
+    body_html = markdown_to_html(markdown)
+    storage_key = f"chronicle::{slugify(title)}::{created_at.strftime('%Y%m%d%H%M%S')}"
+    description = html.escape(extract_plain_text(markdown)[:160], quote=True)
+    safe_title = html.escape(title)
     edition_label = created_at.strftime("%B %d, %Y")
-    storage_key = f"newsletter-studio::{slugify(display_title)}::{created_at.strftime('%Y%m%d%H%M%S')}"
-    description = html.escape(extract_plain_text(standfirst)[:160], quote=True)
-    safe_title = html.escape(display_title)
-    safe_standfirst = format_inline_markdown(standfirst)
-    download_name = f"{slugify(display_title)}-editable.html"
+    download_name = f"{slugify(title)}-editable.html"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -2007,67 +1492,42 @@ def render_editable_newsletter_html(fallback_title, markdown, created_at):
   <meta name="description" content="{description}">
   <style>
     :root {{
-      --bg: #f3ede4;
-      --paper: rgba(255, 250, 244, 0.88);
-      --paper-strong: #fffaf4;
-      --ink: #17120d;
-      --muted: #6e6153;
-      --accent: #b85c38;
-      --accent-deep: #7f3621;
-      --accent-soft: rgba(184, 92, 56, 0.14);
-      --line: rgba(40, 28, 18, 0.12);
-      --shadow: 0 28px 90px rgba(58, 32, 15, 0.14);
-      --display-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
-      --ui-font: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
-      --mono-font: "SFMono-Regular", "Menlo", "Consolas", monospace;
+      --bg: #0c1118;
+      --panel: rgba(15, 22, 32, 0.92);
+      --panel-soft: rgba(23, 32, 45, 0.88);
+      --ink: #edf3fb;
+      --muted: #8ca0b9;
+      --line: rgba(151, 173, 202, 0.16);
+      --accent: #d07b4a;
+      --accent-strong: #ef9b65;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      --display: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      --ui: "Avenir Next", "Segoe UI", sans-serif;
+      --mono: "SFMono-Regular", Menlo, monospace;
     }}
 
     * {{
       box-sizing: border-box;
     }}
 
-    html {{
-      scroll-behavior: smooth;
-    }}
-
     body {{
       margin: 0;
       min-height: 100vh;
       color: var(--ink);
+      font-family: var(--ui);
       background:
-        radial-gradient(circle at top left, rgba(255, 220, 194, 0.9), transparent 34%),
-        radial-gradient(circle at 85% 12%, rgba(201, 112, 67, 0.16), transparent 22%),
-        linear-gradient(180deg, #f8f1e7 0%, #efe5d8 48%, #ecdfd1 100%);
-      font-family: var(--ui-font);
+        radial-gradient(circle at top left, rgba(208, 123, 74, 0.22), transparent 28%),
+        radial-gradient(circle at 85% 10%, rgba(98, 132, 255, 0.16), transparent 22%),
+        linear-gradient(180deg, #081017 0%, #0d1520 50%, #111b27 100%);
     }}
 
-    body::before {{
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background:
-        linear-gradient(135deg, rgba(255, 255, 255, 0.28), transparent 40%),
-        repeating-linear-gradient(
-          0deg,
-          rgba(23, 18, 13, 0.02),
-          rgba(23, 18, 13, 0.02) 1px,
-          transparent 1px,
-          transparent 8px
-        );
-      mix-blend-mode: multiply;
-      opacity: 0.42;
-    }}
-
-    .page-shell {{
-      width: min(1280px, calc(100vw - 32px));
+    .shell {{
+      width: min(1200px, calc(100vw - 28px));
       margin: 0 auto;
-      padding: 24px 0 72px;
-      position: relative;
-      z-index: 1;
+      padding: 22px 0 48px;
     }}
 
-    .studio-toolbar {{
+    .toolbar {{
       position: sticky;
       top: 18px;
       z-index: 20;
@@ -2075,961 +1535,378 @@ def render_editable_newsletter_html(fallback_title, markdown, created_at):
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
+      gap: 12px;
       padding: 14px 18px;
-      border: 1px solid rgba(255, 255, 255, 0.45);
-      border-radius: 22px;
-      background: rgba(27, 18, 10, 0.78);
-      box-shadow: 0 18px 40px rgba(15, 10, 7, 0.18);
-      backdrop-filter: blur(22px);
-      color: #fff8ef;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: rgba(7, 12, 18, 0.8);
+      backdrop-filter: blur(18px);
+      box-shadow: var(--shadow);
     }}
 
     .toolbar-copy {{
       display: flex;
       flex-direction: column;
-      gap: 3px;
-      min-width: 220px;
+      gap: 4px;
     }}
 
     .toolbar-kicker {{
       font-size: 0.72rem;
-      letter-spacing: 0.18em;
+      letter-spacing: 0.14em;
       text-transform: uppercase;
-      color: rgba(255, 248, 239, 0.64);
+      color: var(--muted);
     }}
 
     .toolbar-title {{
-      font-size: 0.98rem;
+      font-size: 1rem;
       font-weight: 600;
-      letter-spacing: 0.01em;
     }}
 
     .toolbar-actions {{
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      align-items: center;
     }}
 
-    .toolbar-button,
-    .toolbar-pill {{
+    button {{
       border: 0;
       border-radius: 999px;
       padding: 10px 14px;
       font: inherit;
-      font-size: 0.88rem;
       cursor: pointer;
-      transition: transform 160ms ease, background 160ms ease, color 160ms ease;
-    }}
-
-    .toolbar-button {{
-      background: rgba(255, 255, 255, 0.12);
-      color: #fff8ef;
-    }}
-
-    .toolbar-button:hover,
-    .toolbar-button:focus-visible {{
-      transform: translateY(-1px);
-      background: rgba(255, 255, 255, 0.2);
-      outline: none;
-    }}
-
-    .toolbar-button.primary {{
-      background: linear-gradient(135deg, #d8794e, #b65333);
-      color: white;
-    }}
-
-    .toolbar-pill {{
+      color: var(--ink);
       background: rgba(255, 255, 255, 0.08);
-      color: rgba(255, 248, 239, 0.7);
-      cursor: default;
+      transition: transform 160ms ease, background 160ms ease;
     }}
 
-    .studio-grid {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 280px;
-      gap: 28px;
-      margin-top: 28px;
-      align-items: start;
+    button:hover {{
+      transform: translateY(-1px);
+      background: rgba(255, 255, 255, 0.14);
     }}
 
-    .newsletter-card {{
-      position: relative;
-      overflow: hidden;
-      border-radius: 34px;
-      border: 1px solid rgba(255, 255, 255, 0.5);
-      background:
-        radial-gradient(circle at top right, rgba(255, 227, 205, 0.84), transparent 28%),
-        linear-gradient(180deg, rgba(255, 252, 248, 0.96), rgba(255, 248, 240, 0.94));
+    button.primary {{
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      color: #1b120c;
+      font-weight: 700;
+    }}
+
+    .card {{
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(180deg, var(--panel), var(--panel-soft));
       box-shadow: var(--shadow);
-      animation: rise 480ms ease both;
+      overflow: hidden;
     }}
 
-    .newsletter-card::after {{
-      content: "";
-      position: absolute;
-      right: -90px;
-      top: -120px;
-      width: 320px;
-      height: 320px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(216, 121, 78, 0.22), transparent 68%);
-      pointer-events: none;
-    }}
-
-    .hero {{
-      position: relative;
-      padding: 68px 74px 34px;
-    }}
-
-    .hero-meta {{
+    .meta {{
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-bottom: 18px;
-      align-items: center;
-    }}
-
-    .eyebrow,
-    .meta-chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      border-radius: 999px;
-      padding: 8px 14px;
-      font-size: 0.76rem;
-      letter-spacing: 0.14em;
+      padding: 22px 26px 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+      letter-spacing: 0.06em;
       text-transform: uppercase;
     }}
 
-    .eyebrow {{
-      background: rgba(255, 255, 255, 0.72);
-      color: var(--accent-deep);
-      border: 1px solid rgba(184, 92, 56, 0.18);
+    .editor {{
+      min-height: 72vh;
+      padding: 26px;
+      outline: none;
+      line-height: 1.72;
+      font-size: 1.05rem;
     }}
 
-    .meta-chip {{
-      background: rgba(24, 18, 13, 0.06);
-      color: rgba(23, 18, 13, 0.65);
-      border: 1px solid rgba(23, 18, 13, 0.08);
-    }}
-
-    .headline {{
-      margin: 0;
-      max-width: 11ch;
-      font-family: var(--display-font);
-      font-size: clamp(3rem, 8vw, 5.9rem);
-      line-height: 0.94;
-      letter-spacing: -0.05em;
-    }}
-
-    .standfirst {{
-      margin: 22px 0 0;
-      max-width: 760px;
-      color: rgba(23, 18, 13, 0.76);
-      font-size: clamp(1.02rem, 1.2vw + 0.8rem, 1.34rem);
-      line-height: 1.75;
-    }}
-
-    .content-shell {{
-      display: grid;
-      gap: 30px;
-      padding: 0 34px 34px;
-    }}
-
-    .story-panel,
-    .sources-panel,
-    .rail-card {{
-      border-radius: 28px;
-      border: 1px solid var(--line);
-      background: var(--paper);
-      backdrop-filter: blur(12px);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.46);
-    }}
-
-    .story-panel {{
-      padding: 42px 40px 44px;
-    }}
-
-    .story-panel p,
-    .story-panel li {{
-      margin: 0 0 1.2em;
-      font-family: var(--display-font);
-      font-size: 1.14rem;
-      line-height: 1.92;
-      color: rgba(23, 18, 13, 0.92);
-    }}
-
-    .story-panel p:last-child,
-    .story-panel li:last-child {{
-      margin-bottom: 0;
-    }}
-
-    .story-panel p:first-child::first-letter {{
-      float: left;
-      margin: 0.12em 0.12em 0 0;
-      font-family: var(--display-font);
-      font-size: 4.7rem;
-      line-height: 0.75;
-      color: var(--accent-deep);
-    }}
-
-    .story-panel h2,
-    .story-panel h3 {{
-      margin: 2.3rem 0 1rem;
-      color: var(--ink);
-      line-height: 1.08;
-    }}
-
-    .story-panel h2 {{
-      font-family: var(--ui-font);
-      font-size: 0.92rem;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-    }}
-
-    .story-panel h3 {{
-      font-family: var(--display-font);
-      font-size: 1.8rem;
+    .editor h1,
+    .editor h2,
+    .editor h3 {{
+      font-family: var(--display);
+      line-height: 1.04;
+      margin: 0 0 16px;
       letter-spacing: -0.03em;
     }}
 
-    .story-panel ul,
-    .story-panel ol {{
-      margin: 0 0 1.5rem;
-      padding-left: 1.3rem;
+    .editor h1 {{
+      font-size: clamp(2.8rem, 7vw, 5rem);
+      margin-top: 8px;
     }}
 
-    .story-panel blockquote {{
-      margin: 1.8rem 0;
-      padding: 1rem 1.2rem 1rem 1.4rem;
-      border-left: 4px solid var(--accent);
-      background: rgba(184, 92, 56, 0.06);
-      font-family: var(--display-font);
-      font-size: 1.14rem;
-      color: rgba(23, 18, 13, 0.88);
+    .editor h2 {{
+      font-size: clamp(1.5rem, 3vw, 2.25rem);
+      margin-top: 38px;
     }}
 
-    .story-panel hr {{
-      border: 0;
-      height: 1px;
-      background: linear-gradient(90deg, transparent, rgba(23, 18, 13, 0.18), transparent);
-      margin: 2rem 0;
+    .editor p {{
+      margin: 0 0 16px;
+      color: rgba(237, 243, 251, 0.92);
     }}
 
-    .citation {{
-      display: inline-flex;
-      transform: translateY(-0.1em);
-      margin-left: 0.08em;
-      padding: 0.1em 0.48em;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: var(--accent-deep);
-      font-family: var(--ui-font);
-      font-size: 0.76rem;
-      font-weight: 600;
-      line-height: 1.4;
-      vertical-align: middle;
+    .editor ul {{
+      margin: 0 0 18px 22px;
+      padding: 0;
     }}
 
-    .insight-card {{
-      margin: 2rem 0;
-      padding: 1.4rem 1.5rem;
-      border-radius: 22px;
-      background:
-        linear-gradient(135deg, rgba(184, 92, 56, 0.12), rgba(255, 255, 255, 0.82)),
-        var(--paper-strong);
-      border: 1px solid rgba(184, 92, 56, 0.18);
-      box-shadow: 0 14px 28px rgba(184, 92, 56, 0.08);
+    .editor li {{
+      margin: 0 0 10px;
     }}
 
-    .insight-label {{
-      margin-bottom: 0.55rem;
-      font-size: 0.76rem;
-      font-weight: 700;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      color: var(--accent-deep);
+    .editor code {{
+      font-family: var(--mono);
+      background: rgba(255, 255, 255, 0.08);
+      padding: 2px 6px;
+      border-radius: 6px;
     }}
 
-    .insight-card p {{
-      margin: 0;
+    .foot {{
+      padding: 0 26px 24px;
+      color: var(--muted);
+      font-size: 0.9rem;
     }}
 
-    .sources-panel {{
-      padding: 34px 34px 36px;
-    }}
-
-    .section-label {{
-      margin: 0 0 8px;
-      color: var(--accent-deep);
-      font-size: 0.74rem;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-    }}
-
-    .section-title {{
-      margin: 0 0 20px;
-      font-family: var(--display-font);
-      font-size: clamp(1.9rem, 3vw, 2.5rem);
-      line-height: 1;
-      letter-spacing: -0.04em;
-    }}
-
-    .sources-grid {{
-      display: grid;
-      gap: 14px;
-    }}
-
-    .source-card {{
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 16px;
-      align-items: start;
-      padding: 16px 18px;
-      border-radius: 20px;
-      border: 1px solid rgba(23, 18, 13, 0.08);
-      background: rgba(255, 255, 255, 0.72);
-      color: inherit;
-      text-decoration: none;
-    }}
-
-    .source-ref {{
-      min-width: 52px;
-      padding-top: 2px;
-      color: var(--accent-deep);
-      font-size: 0.82rem;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }}
-
-    .source-title {{
-      display: block;
-      font-size: 1rem;
-      font-weight: 600;
-      line-height: 1.45;
-      color: var(--ink);
-    }}
-
-    .source-url {{
-      display: inline-block;
-      margin-top: 6px;
-      color: rgba(23, 18, 13, 0.58);
-      font-size: 0.84rem;
-      word-break: break-word;
-    }}
-
-    .sources-empty {{
-      margin: 0;
-      color: rgba(23, 18, 13, 0.56);
-      font-size: 0.98rem;
-      line-height: 1.7;
-    }}
-
-    .rail {{
-      display: grid;
-      gap: 18px;
-      position: sticky;
-      top: 106px;
-    }}
-
-    .rail-card {{
-      padding: 18px 18px 20px;
-    }}
-
-    .rail-card h3 {{
-      margin: 0 0 8px;
-      font-size: 0.82rem;
-      font-weight: 700;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-      color: var(--accent-deep);
-    }}
-
-    .rail-card p,
-    .rail-card li {{
-      margin: 0;
-      color: rgba(23, 18, 13, 0.72);
-      font-size: 0.95rem;
-      line-height: 1.7;
-    }}
-
-    .rail-card ul {{
-      margin: 12px 0 0;
-      padding-left: 1.1rem;
-    }}
-
-    .metric {{
-      display: flex;
-      align-items: baseline;
-      gap: 8px;
-      margin-top: 12px;
-    }}
-
-    .metric strong {{
-      font-family: var(--display-font);
-      font-size: 2.5rem;
-      line-height: 1;
-      letter-spacing: -0.04em;
-    }}
-
-    .editable {{
-      outline: none;
-      transition: box-shadow 160ms ease, background 160ms ease;
-    }}
-
-    .editable:focus {{
-      background: rgba(255, 255, 255, 0.58);
-      box-shadow: 0 0 0 3px rgba(184, 92, 56, 0.18);
-      border-radius: 12px;
-    }}
-
-    .status-ok {{
-      color: #ffd9c9;
-    }}
-
-    .toolbar-hint {{
-      color: rgba(255, 248, 239, 0.58);
-      font-size: 0.78rem;
-    }}
-
-    @keyframes rise {{
-      from {{
-        opacity: 0;
-        transform: translateY(14px);
-      }}
-      to {{
-        opacity: 1;
-        transform: translateY(0);
-      }}
-    }}
-
-    @media (max-width: 1040px) {{
-      .studio-grid {{
-        grid-template-columns: 1fr;
+    @media (max-width: 720px) {{
+      .shell {{
+        width: min(100vw - 16px, 1200px);
+        padding-top: 12px;
       }}
 
-      .rail {{
-        position: static;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      }}
-    }}
-
-    @media (max-width: 760px) {{
-      .page-shell {{
-        width: min(100vw - 16px, 100%);
-        padding-top: 16px;
-      }}
-
-      .studio-toolbar {{
-        top: 10px;
-        padding: 12px;
-        border-radius: 18px;
-      }}
-
-      .hero {{
-        padding: 42px 24px 22px;
-      }}
-
-      .headline {{
-        max-width: none;
-      }}
-
-      .content-shell {{
-        padding: 0 16px 16px;
-      }}
-
-      .story-panel,
-      .sources-panel {{
-        padding: 26px 22px 28px;
-      }}
-    }}
-
-    @media print {{
-      body {{
-        background: white;
-      }}
-
-      body::before,
-      .studio-toolbar,
-      .rail {{
-        display: none !important;
-      }}
-
-      .page-shell {{
-        width: 100%;
-        padding: 0;
-      }}
-
-      .newsletter-card,
-      .story-panel,
-      .sources-panel {{
-        border: none;
-        box-shadow: none;
-        background: white;
+      .editor {{
+        padding: 20px;
       }}
     }}
   </style>
 </head>
 <body>
-  <div class="page-shell">
-    <div class="studio-toolbar">
+  <div class="shell">
+    <div class="toolbar">
       <div class="toolbar-copy">
-        <span class="toolbar-kicker">Newsletter Studio</span>
-        <strong class="toolbar-title">{safe_title}</strong>
+        <div class="toolbar-kicker">Chronicle HTML editor</div>
+        <div class="toolbar-title">{safe_title}</div>
       </div>
       <div class="toolbar-actions">
-        <button class="toolbar-button" type="button" data-command="bold">Bold</button>
-        <button class="toolbar-button" type="button" data-command="italic">Italic</button>
-        <button class="toolbar-button" type="button" data-command="formatBlock" data-value="H2">H2</button>
-        <button class="toolbar-button" type="button" data-command="formatBlock" data-value="BLOCKQUOTE">Quote</button>
-        <button class="toolbar-button" type="button" data-command="insertHorizontalRule">Rule</button>
-        <button class="toolbar-button primary" type="button" data-action="download">Save HTML</button>
-        <button class="toolbar-button" type="button" data-action="print">Print</button>
-        <button class="toolbar-button" type="button" data-action="reset">Reset</button>
-        <span class="toolbar-pill" id="save-status">Draft loaded</span>
-        <span class="toolbar-pill" id="word-count">0 words</span>
+        <button type="button" id="restore-button">Restore saved draft</button>
+        <button type="button" id="download-button" class="primary">Download HTML</button>
       </div>
     </div>
 
-    <div class="studio-grid">
-      <article class="newsletter-card" data-editable-root>
-        <header class="hero">
-          <div class="hero-meta">
-            <span class="eyebrow">Ready to publish</span>
-            <span class="meta-chip">{html.escape(edition_label)}</span>
-            <span class="meta-chip">Editable local draft</span>
-          </div>
-          <h1 class="headline editable" contenteditable="true" spellcheck="true">{safe_title}</h1>
-          <p class="standfirst editable" contenteditable="true" spellcheck="true">{safe_standfirst}</p>
-        </header>
-
-        <div class="content-shell">
-          <section class="story-panel editable" contenteditable="true" spellcheck="true" id="story-body">
-{body_html}
-          </section>
-
-          <section class="sources-panel">
-            <p class="section-label">Verification trail</p>
-            <h2 class="section-title editable" contenteditable="true" spellcheck="true">Sources</h2>
-            <div class="sources-grid editable" contenteditable="true" spellcheck="true">
-{sources_html}
-            </div>
-          </section>
-        </div>
-      </article>
-
-      <aside class="rail">
-        <section class="rail-card">
-          <h3>Editing flow</h3>
-          <p>Click anywhere in the headline, dek, body, or sources and edit directly. The page saves your draft in local browser storage.</p>
-        </section>
-        <section class="rail-card">
-          <h3>Publish finish</h3>
-          <p>Use <strong>Save HTML</strong> when the newsletter is ready. Use <strong>Print</strong> for a clean PDF or a quick browser-based export.</p>
-        </section>
-        <section class="rail-card">
-          <h3>Word count</h3>
-          <div class="metric">
-            <strong id="word-count-rail">0</strong>
-            <span>words</span>
-          </div>
-          <p style="margin-top: 12px;">This count updates as you edit the draft.</p>
-        </section>
-      </aside>
+    <div class="card">
+      <div class="meta">
+        <span>{html.escape(edition_label)}</span>
+        <span>Editable issue</span>
+      </div>
+      <article id="editor" class="editor" contenteditable="true" spellcheck="true">{body_html}</article>
+      <div class="foot">Changes are saved to this browser automatically while the page stays open.</div>
     </div>
   </div>
 
   <script>
-    (() => {{
-      const editorRoot = document.querySelector("[data-editable-root]");
-      const storyBody = document.getElementById("story-body");
-      const saveStatus = document.getElementById("save-status");
-      const wordCountBadge = document.getElementById("word-count");
-      const wordCountRail = document.getElementById("word-count-rail");
-      const storageKey = {json.dumps(storage_key)};
-      const downloadName = {json.dumps(download_name)};
-      const initialMarkup = editorRoot.innerHTML;
-      let saveTimer = null;
+    const storageKey = {json.dumps(storage_key)};
+    const editor = document.getElementById("editor");
+    const restoreButton = document.getElementById("restore-button");
+    const downloadButton = document.getElementById("download-button");
 
-      function countWords(text) {{
-        const trimmed = text.trim();
-        return trimmed ? trimmed.split(/\\s+/).length : 0;
+    const savedHtml = window.localStorage.getItem(storageKey);
+    if (savedHtml) {{
+      editor.innerHTML = savedHtml;
+    }}
+
+    editor.addEventListener("input", () => {{
+      window.localStorage.setItem(storageKey, editor.innerHTML);
+    }});
+
+    restoreButton.addEventListener("click", () => {{
+      const cached = window.localStorage.getItem(storageKey);
+      if (cached) {{
+        editor.innerHTML = cached;
       }}
+    }});
 
-      function updateWordCount() {{
-        const total = countWords(storyBody.innerText);
-        wordCountBadge.textContent = `${{total}} words`;
-        wordCountRail.textContent = String(total);
-      }}
-
-      function setStatus(message) {{
-        saveStatus.textContent = message;
-      }}
-
-      function persistDraft() {{
-        try {{
-          localStorage.setItem(storageKey, editorRoot.innerHTML);
-          setStatus("Saved locally");
-        }} catch (error) {{
-          setStatus("Local save unavailable");
-        }}
-        updateWordCount();
-      }}
-
-      function queueSave() {{
-        setStatus("Editing...");
-        window.clearTimeout(saveTimer);
-        saveTimer = window.setTimeout(persistDraft, 250);
-      }}
-
-      function restoreDraft() {{
-        try {{
-          const savedDraft = localStorage.getItem(storageKey);
-          if (savedDraft) {{
-            editorRoot.innerHTML = savedDraft;
-            setStatus("Recovered local draft");
-          }}
-        }} catch (error) {{
-          setStatus("Draft loaded");
-        }}
-      }}
-
-      function downloadHtml() {{
-        const content = "<!DOCTYPE html>\\n" + document.documentElement.outerHTML;
-        const blob = new Blob([content], {{ type: "text/html;charset=utf-8" }});
-        const href = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = href;
-        link.download = downloadName;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(href);
-        setStatus("HTML exported");
-      }}
-
-      function resetDraft() {{
-        editorRoot.innerHTML = initialMarkup;
-        try {{
-          localStorage.removeItem(storageKey);
-        }} catch (error) {{
-          // ignore storage failures during reset
-        }}
-        setStatus("Reset to generated draft");
-        updateWordCount();
-      }}
-
-      document.querySelectorAll("[data-command]").forEach((button) => {{
-        button.addEventListener("click", () => {{
-          const command = button.dataset.command;
-          const value = button.dataset.value || null;
-          document.execCommand(command, false, value);
-          queueSave();
-        }});
-      }});
-
-      document.querySelectorAll("[data-action]").forEach((button) => {{
-        button.addEventListener("click", () => {{
-          const action = button.dataset.action;
-          if (action === "download") {{
-            downloadHtml();
-          }} else if (action === "print") {{
-            window.print();
-          }} else if (action === "reset") {{
-            resetDraft();
-          }}
-        }});
-      }});
-
-      editorRoot.addEventListener("input", queueSave);
-      restoreDraft();
-      updateWordCount();
-    }})();
+    downloadButton.addEventListener("click", () => {{
+      const htmlText = document.documentElement.outerHTML;
+      const blob = new Blob([htmlText], {{ type: "text/html;charset=utf-8" }});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = {json.dumps(download_name)};
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }});
   </script>
 </body>
 </html>
 """
 
 
-def parse_newsletter_markdown(markdown, fallback_title):
+def markdown_to_html(markdown):
     lines = normalize_newsletter_markdown(markdown).splitlines()
-    title = fallback_title.strip() or "Newsletter"
-    blocks = []
-    sources = []
-    paragraph_lines = []
-    list_items = []
-    list_type = None
-    in_sources_section = False
+    html_lines = []
+    in_list = False
 
-    def flush_paragraph():
-        nonlocal paragraph_lines
-        if not paragraph_lines:
-            return
-        blocks.append(
-            {
-                "type": "paragraph",
-                "text": " ".join(line.strip() for line in paragraph_lines).strip(),
-            }
-        )
-        paragraph_lines = []
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            html_lines.append("</ul>")
+            in_list = False
 
-    def flush_list():
-        nonlocal list_items
-        nonlocal list_type
-        if not list_items:
-            return
-        blocks.append(
-            {
-                "type": "list",
-                "ordered": list_type == "ordered",
-                "items": list_items[:],
-            }
-        )
-        list_items = []
-        list_type = None
-
-    for raw_line in lines:
-        stripped = raw_line.strip()
+    for line in lines:
+        stripped = line.strip()
         if not stripped:
-            flush_paragraph()
-            flush_list()
+            close_list()
             continue
 
-        title_match = re.match(r"^#\s+(.+)$", stripped)
-        if title_match:
-            flush_paragraph()
-            flush_list()
-            title = extract_plain_text(title_match.group(1)) or title
+        if stripped.startswith("# "):
+            close_list()
+            html_lines.append(f"<h1>{format_inline_markdown(stripped[2:].strip())}</h1>")
             continue
 
-        if is_sources_heading(stripped):
-            flush_paragraph()
-            flush_list()
-            in_sources_section = True
+        if stripped.startswith("## "):
+            close_list()
+            html_lines.append(f"<h2>{format_inline_markdown(stripped[3:].strip())}</h2>")
             continue
 
-        source_match = re.match(r"^\[([^\]]+)\]:\s*(.+)$", stripped)
-        if source_match:
-            flush_paragraph()
-            flush_list()
-            in_sources_section = True
-            sources.append(build_source_entry(source_match.group(1), source_match.group(2)))
+        if stripped.startswith("### "):
+            close_list()
+            html_lines.append(f"<h3>{format_inline_markdown(stripped[4:].strip())}</h3>")
             continue
 
-        if in_sources_section:
-            if sources:
-                sources[-1]["title"] = clean_text(f"{sources[-1]['title']} {stripped}")
+        if stripped.startswith("- "):
+            if not in_list:
+                html_lines.append("<ul>")
+                in_list = True
+            html_lines.append(f"<li>{format_inline_markdown(stripped[2:].strip())}</li>")
             continue
 
-        heading_match = re.match(r"^(#{2,6})\s+(.+)$", stripped)
-        if heading_match:
-            flush_paragraph()
-            flush_list()
-            blocks.append(
-                {
-                    "type": "heading",
-                    "level": min(max(len(heading_match.group(1)), 2), 3),
-                    "text": heading_match.group(2).strip(),
-                }
-            )
-            continue
+        close_list()
+        html_lines.append(f"<p>{format_inline_markdown(stripped)}</p>")
 
-        standalone_bold_match = re.match(r"^\*\*(.+?)\*\*$", stripped)
-        if standalone_bold_match:
-            flush_paragraph()
-            flush_list()
-            blocks.append(
-                {
-                    "type": "heading",
-                    "level": 2,
-                    "text": standalone_bold_match.group(1).strip(),
-                }
-            )
-            continue
-
-        unordered_match = re.match(r"^[-*]\s+(.+)$", stripped)
-        if unordered_match:
-            flush_paragraph()
-            item_text = unordered_match.group(1).strip()
-            if list_type not in {None, "unordered"}:
-                flush_list()
-            list_type = "unordered"
-            list_items.append(item_text)
-            continue
-
-        ordered_match = re.match(r"^\d+\.\s+(.+)$", stripped)
-        if ordered_match:
-            flush_paragraph()
-            item_text = ordered_match.group(1).strip()
-            if list_type not in {None, "ordered"}:
-                flush_list()
-            list_type = "ordered"
-            list_items.append(item_text)
-            continue
-
-        if stripped == "---":
-            flush_paragraph()
-            flush_list()
-            blocks.append({"type": "divider"})
-            continue
-
-        if list_items:
-            flush_list()
-        paragraph_lines.append(stripped)
-
-    flush_paragraph()
-    flush_list()
-
-    standfirst = ""
-    if blocks and blocks[0]["type"] == "paragraph":
-        standfirst = blocks.pop(0)["text"]
-
-    return {
-        "title": title,
-        "standfirst": standfirst,
-        "blocks": blocks,
-        "sources": sources,
-    }
-
-
-def is_sources_heading(text):
-    normalized = extract_plain_text(text).lower().rstrip(":")
-    return normalized in {"sources", "final sources"}
-
-
-def build_source_entry(label, content):
-    source_text = clean_text(content)
-    url = ""
-    title = source_text
-    url_match = re.search(r"(https?://\S+)$", source_text)
-    if url_match:
-        url = url_match.group(1).rstrip(").,")
-        title = source_text[: url_match.start()].rstrip(" -:")
-    return {
-        "label": f"[{label}]",
-        "title": title or source_text,
-        "url": url,
-    }
-
-
-def render_newsletter_body_html(blocks):
-    if not blocks:
-        return "            <p>Start writing. This body is directly editable.</p>\n"
-
-    fragments = []
-    for block in blocks:
-        if block["type"] == "heading":
-            tag_name = "h2" if block["level"] <= 2 else "h3"
-            fragments.append(f"            <{tag_name}>{format_inline_markdown(block['text'])}</{tag_name}>")
-            continue
-
-        if block["type"] == "paragraph":
-            insight_match = re.match(r"^\*\*Killer Insight:\*\*\s*(.+)$", block["text"], re.IGNORECASE)
-            if insight_match:
-                fragments.append(
-                    "            <aside class=\"insight-card\">"
-                    "<div class=\"insight-label\">Killer Insight</div>"
-                    f"<p>{format_inline_markdown(insight_match.group(1).strip())}</p>"
-                    "</aside>"
-                )
-            else:
-                fragments.append(f"            <p>{format_inline_markdown(block['text'])}</p>")
-            continue
-
-        if block["type"] == "list":
-            tag_name = "ol" if block["ordered"] else "ul"
-            list_items = "".join(
-                f"<li>{format_inline_markdown(item)}</li>"
-                for item in block["items"]
-            )
-            fragments.append(f"            <{tag_name}>{list_items}</{tag_name}>")
-            continue
-
-        if block["type"] == "divider":
-            fragments.append("            <hr>")
-
-    return "\n".join(fragments) + "\n"
-
-
-def render_sources_html(sources):
-    if not sources:
-        return (
-            "              <p class=\"sources-empty\">"
-            "Add links, citations, or reporting notes here before publishing."
-            "</p>\n"
-        )
-
-    cards = []
-    for source in sources:
-        label = html.escape(source["label"])
-        title = html.escape(source["title"])
-        url = html.escape(source["url"], quote=True)
-        display_url = html.escape(source["url"] or "Add source URL")
-        if source["url"]:
-            card_html = (
-                "              <a class=\"source-card\" "
-                f"href=\"{url}\" target=\"_blank\" rel=\"noreferrer\">"
-                f"<span class=\"source-ref\">{label}</span>"
-                "<span>"
-                f"<span class=\"source-title\">{title}</span>"
-                f"<span class=\"source-url\">{display_url}</span>"
-                "</span>"
-                "</a>"
-            )
-        else:
-            card_html = (
-                "              <div class=\"source-card\">"
-                f"<span class=\"source-ref\">{label}</span>"
-                "<span>"
-                f"<span class=\"source-title\">{title}</span>"
-                f"<span class=\"source-url\">{display_url}</span>"
-                "</span>"
-                "</div>"
-            )
-        cards.append(card_html)
-
-    return "\n".join(cards) + "\n"
+    close_list()
+    return "\n".join(html_lines)
 
 
 def format_inline_markdown(text):
-    safe_text = html.escape(text)
-    safe_text = re.sub(
-        r"\[([^\]]+)\]\((https?://[^)]+)\)",
-        lambda match: (
-            f'<a href="{html.escape(match.group(2), quote=True)}" target="_blank" '
-            f'rel="noreferrer">{html.escape(match.group(1))}</a>'
-        ),
-        safe_text,
-    )
-    safe_text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe_text)
-    safe_text = re.sub(r"(?<!\*)\*(.+?)\*(?!\*)", r"<em>\1</em>", safe_text)
-    safe_text = re.sub(
-        r"(?<!\w)\[(M?\d+)\]",
-        r'<span class="citation">[\1]</span>',
-        safe_text,
-    )
-    return safe_text
+    value = html.escape(str(text or ""))
+    value = re.sub(r"`([^`]+)`", r"<code>\1</code>", value)
+    value = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", value)
+    value = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", value)
+    return value
 
 
-def extract_plain_text(text):
-    plain_text = str(text or "")
-    plain_text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", plain_text)
-    plain_text = re.sub(r"[*_`#>\[\]]", "", plain_text)
-    return clean_text(plain_text)
+def extract_title_from_markdown(markdown, fallback_title):
+    match = re.search(r"(?m)^#\s+(.+)$", normalize_newsletter_markdown(markdown))
+    return clean_text(match.group(1)) if match else (clean_text(fallback_title) or "Newsletter")
+
+
+def extract_plain_text(value):
+    text = normalize_newsletter_markdown(value)
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = text.replace("\n", " ")
+    return clean_text(text)
+
+
+def resolve_explanation_style(explanation_style, style_instructions):
+    style = clean_text(explanation_style or "concise").lower()
+    if style not in {"concise", "feynman", "soc", "custom"}:
+        style = "concise"
+
+    custom_instructions = clean_text(style_instructions or "")
+    if style == "custom" and not custom_instructions:
+        raise SystemExit("Custom style instructions are required when explanation style is custom.")
+
+    return style, custom_instructions
+
+
+def clean_source_title(title):
+    value = clean_text(title)
+    return re.sub(
+        r"\s+-\s+(Reuters|AP News|Associated Press|MSN|AOL\.com|Yahoo!?\s*News|DW\.com|The New York Times|Al Jazeera|National Post|Toronto Star|Britannica|reuters\.com)$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def normalize_source_phrase(value):
+    normalized = re.sub(
+        r"\b(reuters|ap news|associated press|msn|aol\.com|yahoo!?\s*news|dw\.com|the new york times|al jazeera|national post|toronto star|britannica|asia news network|the times of india)\b",
+        " ",
+        str(value or "").lower(),
+    )
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return clean_text(normalized)
+
+
+def compact_evidence_text(text, max_chars):
+    value = clean_text(text or "")
+    if not value or max_chars <= 0:
+        return ""
+
+    value = re.sub(r"\b(title|url|evidence)\s*:\s*", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"https?://\S+", " ", value, flags=re.IGNORECASE)
+    value = clean_text(value)
+    if not value:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    selected = []
+    seen = set()
+    total_length = 0
+
+    for sentence in sentences:
+        cleaned_sentence = clean_text(sentence)
+        if len(cleaned_sentence) < 20:
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", cleaned_sentence.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(cleaned_sentence)
+        total_length += len(cleaned_sentence) + 1
+        if total_length >= max_chars:
+            break
+
+    if not selected:
+        fallback = value[:max_chars].rsplit(" ", 1)[0].strip()
+        return fallback or value[:max_chars].strip()
+
+    compact = clean_text(" ".join(selected))
+    if len(compact) <= max_chars:
+        return compact
+
+    trimmed = compact[:max_chars].rsplit(" ", 1)[0].strip()
+    return trimmed or compact[:max_chars].strip()
+
+
+def strip_tags(value):
+    without_tags = re.sub(r"(?s)<[^>]+>", " ", str(value or ""))
+    return html.unescape(clean_text(without_tags))
+
+
+def read_json_file(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def first_item(value):
+    if isinstance(value, list) and value:
+        return value[0]
+    return ""
 
 
 def slugify(value):
-    lowered = value.lower()
-    cleaned = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
-    return cleaned or "newsletter"
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return slug or "newsletter"
 
 
 def clean_text(value):
-    stripped = re.sub(r"\s+", " ", value)
-    return stripped.strip()
+    text = str(value or "")
+    text = html.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 if __name__ == "__main__":
