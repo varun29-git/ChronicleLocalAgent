@@ -273,6 +273,17 @@ async function runBrowserPipeline(payload) {
   }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
   const modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+  if (modelSummaryCount === 0) {
+    const failureReasons = uniqueStrings(
+      run.resultSummaries
+        .map((summary) => cleanText(summary.model_error || ""))
+        .filter(Boolean)
+    );
+    const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
+    throw new Error(
+      `Model is loaded but produced 0/${run.resultSummaries.length} direct summaries.${reasonText} Check the browser console for worker errors.`
+    );
+  }
   const requiredModelSummaries = Math.max(2, Math.ceil(run.resultSummaries.length * 0.45));
   if (modelSummaryCount < requiredModelSummaries) {
     appendSystemMessage(
@@ -449,10 +460,12 @@ async function summarizeSearchResult(aiSession, rawResult) {
   ];
 
   let lastText = "";
+  let lastErrorMessage = "";
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
       if (isPromptTooLongForSession(aiSession, prepared)) {
+        lastErrorMessage = "prompt_too_long";
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -466,6 +479,7 @@ async function summarizeSearchResult(aiSession, rawResult) {
         return summary;
       }
     } catch (error) {
+      lastErrorMessage = cleanText(error?.message || "") || "generation_failed";
       console.warn(`[Chronicle] Result summarization failed for ${rawResult.title}.`, error);
     }
   }
@@ -475,7 +489,9 @@ async function summarizeSearchResult(aiSession, rawResult) {
     repaired.model_generated = true;
     return repaired;
   }
-  return buildFallbackResultSummary(rawResult);
+  const fallback = buildFallbackResultSummary(rawResult);
+  fallback.model_error = lastErrorMessage || "fallback_without_model_output";
+  return fallback;
 }
 
 async function generateNewsletter(aiSession, run) {
@@ -1583,13 +1599,14 @@ async function ensureBrowserSession() {
   }
 
   state.browserSessionPromise = loadBrowserSession()
-    .then((session) => {
+    .then(async (session) => {
+      await validateModelSession(session);
       state.browserSession = session;
       state.browserRuntimeStatus = "ready";
       const sliceMeta = session.profile?.hasSlices
         ? ` · ${session.profile.label} · num_slices=${session.profile.sliceCount}`
         : "";
-      state.browserRuntimeMessage = `${session.runtimeKind === "worker" || session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model${sliceMeta} · ${runtimeLabelForSession(session)}`;
+      state.browserRuntimeMessage = `${session.runtimeKind === "worker" || session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model${sliceMeta} · ${runtimeLabelForSession(session)} · self-test passed`;
       state.browserRuntimeProgress = 1;
       state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
       renderHeaderStatus();
@@ -1607,6 +1624,17 @@ async function ensureBrowserSession() {
     });
 
   return state.browserSessionPromise;
+}
+
+async function validateModelSession(aiSession) {
+  const prepared = await preparePromptInputs(aiSession, "Reply with exactly: OK");
+  const reply = await generateFromPreparedInputs(aiSession, prepared, {
+    maxNewTokens: 8,
+    timeoutMs: 20000,
+  });
+  if (!/\bok\b/i.test(reply)) {
+    throw new Error("Model loaded but self-test generation failed.");
+  }
 }
 
 async function loadBrowserSession() {
