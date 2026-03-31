@@ -167,10 +167,9 @@ async function hydrateApp() {
 
 function renderHeaderStatus() {
   const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU" : "WASM";
-  const profileLabel = state.browserProfile?.label || "Adaptive slice";
   const progress = clampNumber(
-    state.browserRuntimeStatus === "ready" ? 1 : state.browserRuntimeProgress || 0.04,
-    0.04,
+    state.browserRuntimeStatus === "ready" ? 1 : state.browserRuntimeProgress || 0,
+    0,
     1,
   );
 
@@ -243,18 +242,23 @@ async function runBrowserPipeline(payload) {
   state.activeStageKey = "query";
   updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
-  let aiSession;
-  try {
-    aiSession = await waitForBrowserSessionReady();
+  const sessionPromise = ensureBrowserSession().catch((error) => {
+    console.warn("[Chronicle] Background session warmup failed.", error);
+    return createNoModelSession();
+  });
+  let aiSession = await getBestEffortSession(sessionPromise, 12000);
+  if (aiSession.runtimeKind === "worker") {
     await setSessionSlices(aiSession, QUERY_STAGE_SLICE_COUNT);
-  } catch (error) {
-    console.warn("[Chronicle] Model warmup unavailable, continuing with deterministic fallback path.", error);
-    appendSystemMessage("Model runtime is unavailable right now. Chronicle will continue in deterministic fallback mode for this run.");
-    aiSession = createNoModelSession();
+  } else {
+    appendSystemMessage("Model is still warming. Chronicle will start now and use deterministic output until model becomes ready.");
   }
+
   updateTurnStatus("Generating search queries");
   run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
-  await setSessionSlices(aiSession, aiSession.profile?.sliceCount || QUERY_STAGE_SLICE_COUNT);
+  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 6000);
+  if (aiSession.runtimeKind === "worker") {
+    await setSessionSlices(aiSession, aiSession.profile?.sliceCount || QUERY_STAGE_SLICE_COUNT);
+  }
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
@@ -269,6 +273,7 @@ async function runBrowserPipeline(payload) {
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
 
   state.activeStageKey = "summarize";
+  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 6000);
   const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
   run.summarizeStartedAt = performance.now();
   setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
@@ -304,6 +309,7 @@ async function runBrowserPipeline(payload) {
   run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
 
   state.activeStageKey = "newsletter";
+  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 4000);
   setStageState("newsletter", "active", "Writing issue");
   updateTurnStatus("Generating newsletter");
   run.newsletterStartedAt = performance.now();
@@ -2065,7 +2071,6 @@ async function waitForBrowserSessionReady() {
       throw new Error("The model is taking too long to load on this device. Keep the tab open a little longer, then retry.");
     }
 
-    advanceWarmupTailProgress();
     const now = Date.now();
     if (now - (state.lastWarmupUiUpdateAt || 0) >= 800) {
       const detail = getWarmupProgressLabel();
@@ -2084,9 +2089,9 @@ function beginBrowserLoad(candidate) {
   state.browserLastProgressAt = Date.now();
   state.browserLoadStartedAt = Date.now();
   state.browserRuntimeStatus = "warming";
-  state.browserRuntimeProgress = 0.06;
+  state.browserRuntimeProgress = 0;
   state.browserRuntimeMessage = `Local model · ${candidate.label}`;
-  state.browserRuntimeProgressText = "Preparing model files…";
+  state.browserRuntimeProgressText = "Waiting for download telemetry…";
   renderHeaderStatus();
 }
 
@@ -2101,33 +2106,68 @@ function updateBrowserLoadProgress(candidate, progressInfo = {}) {
     beginBrowserLoad(candidate);
   }
 
-  const key = cleanText(progressInfo.file || progressInfo.name || progressInfo.status || "");
+  const key = cleanText(progressInfo.file || progressInfo.name || "");
   const ratio = resolveLoadRatio(progressInfo);
-  if (key && ratio !== null) {
-    state.browserLoadProgressEntries[key] = ratio;
+  const status = cleanText(progressInfo.status || "").toLowerCase();
+  const loaded = Number(progressInfo.loaded);
+  const total = Number(progressInfo.total);
+
+  if (key) {
+    const previous = state.browserLoadProgressEntries[key];
+    const prevObj = previous && typeof previous === "object" ? previous : {};
+    const nextObj = {
+      ratio: Number.isFinite(ratio) ? ratio : (Number.isFinite(prevObj.ratio) ? prevObj.ratio : null),
+      loaded: Number.isFinite(loaded) ? Math.max(Number(prevObj.loaded || 0), loaded) : Number(prevObj.loaded || 0),
+      total: Number.isFinite(total) && total > 0 ? Math.max(Number(prevObj.total || 0), total) : Number(prevObj.total || 0),
+    };
+    state.browserLoadProgressEntries[key] = nextObj;
+  }
+  if (
+    key
+    || Number.isFinite(ratio)
+    || (Number.isFinite(loaded) && Number.isFinite(total) && total > 0)
+    || ["initiate", "progress", "download", "done", "ready"].includes(status)
+  ) {
     state.browserLastProgressAt = Date.now();
   }
 
-  const progressValues = Object.values(state.browserLoadProgressEntries).filter((value) => Number.isFinite(value));
-  const average = progressValues.length
-    ? progressValues.reduce((sum, value) => sum + value, 0) / progressValues.length
-    : 0;
-  const status = cleanText(progressInfo.status || "").toLowerCase();
-  const isFinalizePhase = status === "done" || status === "ready";
+  const telemetry = summarizeLoadTelemetry(state.browserLoadProgressEntries);
+  const progressRatio = Number.isFinite(telemetry.ratio) ? clampNumber(telemetry.ratio, 0, 1) : null;
+  const phaseLabel = describeLoadProgress(progressInfo);
 
   state.browserRuntimeStatus = "warming";
-  if (isFinalizePhase) {
-    state.browserRuntimeProgress = Math.max(state.browserRuntimeProgress, 0.93);
-    state.browserRuntimeMessage = `Local model · ${candidate.label}`;
-    state.browserRuntimeProgressText = "Downloaded model files · Initializing runtime…";
+  state.browserRuntimeMessage = `Local model · ${candidate.label}`;
+
+  if (progressRatio !== null) {
+    state.browserRuntimeProgress = progressRatio;
+    const percent = Math.round(progressRatio * 100);
+    if (status === "done" || status === "ready" || progressRatio >= 0.999) {
+      if (telemetry.hasByteTotals) {
+        state.browserRuntimeProgressText = `100% files (${formatBytes(telemetry.loadedBytes)} / ${formatBytes(telemetry.totalBytes)}) · Initializing runtime…`;
+      } else {
+        state.browserRuntimeProgressText = "100% files · Initializing runtime…";
+      }
+      renderHeaderStatus();
+      return;
+    }
+
+    if (telemetry.hasByteTotals) {
+      const etaText = estimateEtaFromTransferredBytes(state.browserLoadStartedAt, telemetry.loadedBytes, telemetry.totalBytes);
+      state.browserRuntimeProgressText = `${percent}% files (${formatBytes(telemetry.loadedBytes)} / ${formatBytes(telemetry.totalBytes)}) · ${phaseLabel}${etaText ? ` · ETA ${etaText}` : ""}`;
+    } else {
+      const etaText = estimateEtaFromProgress(state.browserLoadStartedAt, progressRatio);
+      state.browserRuntimeProgressText = `${percent}% files · ${phaseLabel}${etaText ? ` · ETA ${etaText}` : ""}`;
+    }
     renderHeaderStatus();
     return;
   }
 
-  state.browserRuntimeProgress = clampNumber(0.08 + average * 0.82, 0.06, 0.90);
-  state.browserRuntimeMessage = `Local model · ${candidate.label}`;
-  const etaText = estimateEtaFromProgress(state.browserLoadStartedAt, state.browserRuntimeProgress);
-  state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}${etaText ? ` · ETA ${etaText}` : ""}`;
+  if (status === "done" || status === "ready") {
+    state.browserRuntimeProgress = 1;
+    state.browserRuntimeProgressText = "File load complete · Initializing runtime…";
+  } else {
+    state.browserRuntimeProgressText = `${phaseLabel}…`;
+  }
   renderHeaderStatus();
 }
 
@@ -2166,30 +2206,11 @@ function describeLoadProgress(progressInfo) {
 }
 
 function advanceWarmupTailProgress() {
-  if (state.browserRuntimeStatus !== "warming") {
-    return;
-  }
-
-  const sinceLastProgress = Date.now() - (state.browserLastProgressAt || Date.now());
-  if (state.browserRuntimeProgress < 0.90 || sinceLastProgress < 1600) {
-    return;
-  }
-
-  const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU" : "WASM";
-  const tailProgress = clampNumber(
-    0.91 + (Math.min(sinceLastProgress - 1600, 24000) / 24000) * 0.04,
-    0.91,
-    0.95,
-  );
-  if (tailProgress > state.browserRuntimeProgress) {
-    state.browserRuntimeProgress = tailProgress;
-    state.browserRuntimeProgressText = `Initializing ${runtimeLabel} runtime…`;
-    renderHeaderStatus();
-  }
+  // Intentionally no synthetic progress increments.
 }
 
 function getWarmupProgressLabel() {
-  const percent = Math.round(clampNumber(state.browserRuntimeProgress || 0.04, 0.04, 0.95) * 100);
+  const percent = Math.round(clampNumber(state.browserRuntimeProgress || 0, 0, 1) * 100);
   const detail = state.browserRuntimeProgressText || "Loading model files";
   return `${percent}% · ${detail.replace(/^\d+%\s·\s/, "")}`;
 }
@@ -3141,6 +3162,86 @@ function estimateEtaFromProgress(startedAtMs, progress) {
   const projectedTotalMs = elapsedMs / ratio;
   const remainingMs = Math.max(0, Math.round(projectedTotalMs - elapsedMs));
   return formatEta(remainingMs);
+}
+
+function estimateEtaFromTransferredBytes(startedAtMs, loadedBytes, totalBytes) {
+  if (!startedAtMs || !Number.isFinite(loadedBytes) || !Number.isFinite(totalBytes) || loadedBytes <= 0 || totalBytes <= 0 || loadedBytes >= totalBytes) {
+    return "";
+  }
+  const elapsedMs = Math.max(1, Date.now() - startedAtMs);
+  const bytesPerMs = loadedBytes / elapsedMs;
+  if (!Number.isFinite(bytesPerMs) || bytesPerMs <= 0) {
+    return "";
+  }
+  const remainingBytes = Math.max(0, totalBytes - loadedBytes);
+  const remainingMs = Math.round(remainingBytes / bytesPerMs);
+  return formatEta(remainingMs);
+}
+
+function summarizeLoadTelemetry(entries) {
+  const values = Object.values(entries || {});
+  let loadedBytes = 0;
+  let totalBytes = 0;
+  const ratios = [];
+
+  values.forEach((entry) => {
+    if (Number.isFinite(entry)) {
+      ratios.push(entry);
+      return;
+    }
+    if (!entry || typeof entry !== "object") {
+      return;
+    }
+    if (Number.isFinite(entry.ratio)) {
+      ratios.push(entry.ratio);
+    }
+    if (Number.isFinite(entry.total) && entry.total > 0) {
+      totalBytes += entry.total;
+      loadedBytes += Math.min(Math.max(0, Number(entry.loaded || 0)), entry.total);
+    }
+  });
+
+  if (totalBytes > 0) {
+    return {
+      hasByteTotals: true,
+      loadedBytes,
+      totalBytes,
+      ratio: clampNumber(loadedBytes / totalBytes, 0, 1),
+    };
+  }
+
+  if (ratios.length) {
+    const avgRatio = ratios.reduce((sum, ratio) => sum + ratio, 0) / ratios.length;
+    return {
+      hasByteTotals: false,
+      loadedBytes: 0,
+      totalBytes: 0,
+      ratio: clampNumber(avgRatio, 0, 1),
+    };
+  }
+
+  return {
+    hasByteTotals: false,
+    loadedBytes: 0,
+    totalBytes: 0,
+    ratio: null,
+  };
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = size >= 100 ? Math.round(size) : size >= 10 ? size.toFixed(1) : size.toFixed(2);
+  return `${rounded} ${units[unitIndex]}`;
 }
 
 function formatEta(milliseconds) {
