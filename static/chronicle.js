@@ -2044,7 +2044,7 @@ function getBrowserWarmupTimeoutMs() {
   if (state.browserSession?.worker) {
     return 15000;
   }
-  return state.browserCapabilities?.hasWebGPU ? 240000 : 330000;
+  return state.browserCapabilities?.hasWebGPU ? 120000 : 150000;
 }
 
 async function waitForBrowserSessionReady() {
@@ -2112,9 +2112,19 @@ function updateBrowserLoadProgress(candidate, progressInfo = {}) {
   const average = progressValues.length
     ? progressValues.reduce((sum, value) => sum + value, 0) / progressValues.length
     : 0;
+  const status = cleanText(progressInfo.status || "").toLowerCase();
+  const isFinalizePhase = status === "done" || status === "ready";
 
   state.browserRuntimeStatus = "warming";
-  state.browserRuntimeProgress = clampNumber(0.08 + average * 0.88, 0.06, 0.98);
+  if (isFinalizePhase) {
+    state.browserRuntimeProgress = Math.max(state.browserRuntimeProgress, 0.93);
+    state.browserRuntimeMessage = `Local model · ${candidate.label}`;
+    state.browserRuntimeProgressText = "Downloaded model files · Initializing runtime…";
+    renderHeaderStatus();
+    return;
+  }
+
+  state.browserRuntimeProgress = clampNumber(0.08 + average * 0.82, 0.06, 0.90);
   state.browserRuntimeMessage = `Local model · ${candidate.label}`;
   const etaText = estimateEtaFromProgress(state.browserLoadStartedAt, state.browserRuntimeProgress);
   state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}${etaText ? ` · ETA ${etaText}` : ""}`;
@@ -2161,25 +2171,25 @@ function advanceWarmupTailProgress() {
   }
 
   const sinceLastProgress = Date.now() - (state.browserLastProgressAt || Date.now());
-  if (state.browserRuntimeProgress < 0.94 || sinceLastProgress < 1600) {
+  if (state.browserRuntimeProgress < 0.90 || sinceLastProgress < 1600) {
     return;
   }
 
-  const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU runtime" : "WASM runtime";
+  const runtimeLabel = state.browserCapabilities?.hasWebGPU ? "WebGPU" : "WASM";
   const tailProgress = clampNumber(
-    0.96 + (Math.min(sinceLastProgress - 1600, 36000) / 36000) * 0.035,
-    0.96,
-    0.995,
+    0.91 + (Math.min(sinceLastProgress - 1600, 24000) / 24000) * 0.04,
+    0.91,
+    0.95,
   );
   if (tailProgress > state.browserRuntimeProgress) {
     state.browserRuntimeProgress = tailProgress;
-    state.browserRuntimeProgressText = `${Math.round(tailProgress * 100)}% · Finalizing ${runtimeLabel}`;
+    state.browserRuntimeProgressText = `Initializing ${runtimeLabel} runtime…`;
     renderHeaderStatus();
   }
 }
 
 function getWarmupProgressLabel() {
-  const percent = Math.round(clampNumber(state.browserRuntimeProgress || 0.04, 0.04, 0.99) * 100);
+  const percent = Math.round(clampNumber(state.browserRuntimeProgress || 0.04, 0.04, 0.95) * 100);
   const detail = state.browserRuntimeProgressText || "Loading model files";
   return `${percent}% · ${detail.replace(/^\d+%\s·\s/, "")}`;
 }
