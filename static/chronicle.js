@@ -1,7 +1,7 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const MODEL_CANDIDATES = [
-  "onnx-community/Qwen3-0.6B-ONNX",
+  "onnx-community/gemma-3n-E2B-it-ONNX",
 ];
 const NON_GEMMA_DTYPE = "q4f16";
 
@@ -1600,7 +1600,6 @@ async function ensureBrowserSession() {
 
   state.browserSessionPromise = loadBrowserSession()
     .then(async (session) => {
-      await validateModelSession(session);
       state.browserSession = session;
       state.browserRuntimeStatus = "ready";
       const sliceMeta = session.profile?.hasSlices
@@ -1627,14 +1626,27 @@ async function ensureBrowserSession() {
 }
 
 async function validateModelSession(aiSession) {
-  const prepared = await preparePromptInputs(aiSession, "Reply with exactly: OK");
-  const reply = await generateFromPreparedInputs(aiSession, prepared, {
-    maxNewTokens: 8,
-    timeoutMs: 20000,
-  });
-  if (!/\bok\b/i.test(reply)) {
-    throw new Error("Model loaded but self-test generation failed.");
+  const selfTestPrompts = [
+    "Reply with one word: READY",
+    "Write one short sentence about local inference.",
+  ];
+  let lastReply = "";
+  for (const promptText of selfTestPrompts) {
+    try {
+      const prepared = await preparePromptInputs(aiSession, promptText);
+      const reply = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: 24,
+        timeoutMs: 60000,
+      });
+      lastReply = cleanText(reply);
+      if (lastReply.length >= 2) {
+        return;
+      }
+    } catch (error) {
+      lastReply = cleanText(error?.message || "") || lastReply;
+    }
   }
+  throw new Error(`Model loaded but self-test generation failed (${lastReply || "empty output"}).`);
 }
 
 async function loadBrowserSession() {
@@ -1645,11 +1657,13 @@ async function loadBrowserSession() {
     try {
       beginBrowserLoad(candidate);
       const progressCallback = createBrowserLoadProgressHandler(candidate);
-      return await withTimeout(
+      const session = await withTimeout(
         loadTextOnlyBrowserSession(candidate, progressCallback),
         getCandidateLoadTimeoutMs(candidate),
         `Warmup timed out for ${candidate.label}.`,
       );
+      await validateModelSession(session);
+      return session;
     } catch (error) {
       lastError = error;
       resetModelWorker();
@@ -1686,7 +1700,8 @@ async function loadTextOnlyBrowserSession(candidate, progressCallback) {
   await sendWorkerRequest("init", {
     model: candidate.model,
     device: candidate.device,
-    dtype: NON_GEMMA_DTYPE,
+    dtype: candidate.textModelOptions?.dtype || NON_GEMMA_DTYPE,
+    modelKwargs: candidate.textModelOptions?.model_kwargs || {},
     localModelPath: "/models",
     numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
   }, Math.max(60000, getCandidateLoadTimeoutMs(candidate)));
@@ -1834,7 +1849,7 @@ function detectBrowserCapabilities() {
 }
 
 function calculateBrowserProfile(config) {
-  const maxSlices = 20;
+  const maxSlices = 36;
   let sliceCount = 1;
   const availableGiB = config.availableMemoryGiB || 0;
   const effectiveGiB = availableGiB > 0
@@ -1843,16 +1858,24 @@ function calculateBrowserProfile(config) {
 
   if (config.hasWebGPU) {
     if (config.isMobile) {
-      sliceCount = effectiveGiB >= 8 ? 4 : effectiveGiB >= 5 ? 3 : 2;
-    } else if (effectiveGiB >= 18 && config.hardwareConcurrency >= 12) {
-      sliceCount = 10;
-    } else if (effectiveGiB >= 12 && config.hardwareConcurrency >= 10) {
+      sliceCount = effectiveGiB >= 8 ? 12 : effectiveGiB >= 5 ? 8 : 6;
+    } else if (effectiveGiB >= 24 && config.hardwareConcurrency >= 12) {
+      sliceCount = 36;
+    } else if (effectiveGiB >= 18 && config.hardwareConcurrency >= 10) {
+      sliceCount = 28;
+    } else if (effectiveGiB >= 12 && config.hardwareConcurrency >= 8) {
+      sliceCount = 22;
+    } else if (effectiveGiB >= 8) {
+      sliceCount = 16;
+    } else if (effectiveGiB >= 6) {
+      sliceCount = 12;
+    } else if (effectiveGiB >= 4) {
       sliceCount = 8;
-    } else if (effectiveGiB >= 8 && config.hardwareConcurrency >= 8) {
+    } else {
       sliceCount = 6;
-    } else if (effectiveGiB >= 5) {
-      sliceCount = 4;
     }
+  } else {
+    sliceCount = effectiveGiB >= 8 ? 8 : effectiveGiB >= 5 ? 6 : 4;
   }
 
   sliceCount = Math.max(1, Math.min(sliceCount, maxSlices));

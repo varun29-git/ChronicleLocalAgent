@@ -68,7 +68,8 @@ async function initializeWorkerModel(options) {
   tokenizer = await runtime.AutoTokenizer.from_pretrained(modelId, { progress_callback });
   model = await runtime.AutoModelForCausalLM.from_pretrained(modelId, {
     device: String(options.device || "wasm"),
-    dtype: String(options.dtype || "q4f16"),
+    dtype: options.dtype || "q4f16",
+    model_kwargs: options.modelKwargs && typeof options.modelKwargs === "object" ? options.modelKwargs : {},
     progress_callback,
   });
   currentModelId = modelId;
