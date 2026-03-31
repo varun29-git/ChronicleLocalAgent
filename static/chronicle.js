@@ -4,6 +4,7 @@ const MODEL_CANDIDATES = [
   "onnx-community/gemma-3n-E2B-it-ONNX",
 ];
 const NON_GEMMA_DTYPE = "q4f16";
+const QUERY_STAGE_SLICE_COUNT = 1;
 
 const GEMMA3N_DTYPE_MAP = {
   decoder_model_merged: "q4",
@@ -243,8 +244,10 @@ async function runBrowserPipeline(payload) {
   updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
   const aiSession = await waitForBrowserSessionReady();
+  await setSessionSlices(aiSession, QUERY_STAGE_SLICE_COUNT);
   updateTurnStatus("Generating search queries");
   run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
+  await setSessionSlices(aiSession, aiSession.profile?.sliceCount || QUERY_STAGE_SLICE_COUNT);
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
@@ -1709,6 +1712,7 @@ async function loadTextOnlyBrowserSession(candidate, progressCallback) {
     runtimeKind: "worker",
     worker,
     profile: candidate,
+    activeSliceCount: candidate.sliceCount || 1,
   };
 }
 
@@ -1774,6 +1778,44 @@ function sendWorkerRequest(type, payload, timeoutMs = 90000) {
   ).finally(() => {
     state.workerPending.delete(id);
   });
+}
+
+async function setSessionSlices(aiSession, targetSlices) {
+  if (!aiSession?.profile?.hasSlices || aiSession.runtimeKind !== "worker") {
+    return;
+  }
+
+  const maxSlices = aiSession.profile.maxSlices || state.browserProfile?.maxSlices || 36;
+  const requestedSlices = Math.max(1, Math.min(Number(targetSlices || 1), maxSlices));
+  if (requestedSlices === aiSession.activeSliceCount) {
+    return;
+  }
+
+  const baseModelKwargs = aiSession.profile.textModelOptions?.model_kwargs || {};
+  const modelKwargs = {
+    ...baseModelKwargs,
+    num_slices: requestedSlices,
+  };
+
+  state.browserRuntimeStatus = "warming";
+  state.browserRuntimeMessage = `Adjusting Gemma slices · ${requestedSlices}/${maxSlices}`;
+  state.browserRuntimeProgressText = "Applying slice profile…";
+  renderHeaderStatus();
+
+  await sendWorkerRequest("init", {
+    model: aiSession.profile.model,
+    device: aiSession.profile.device,
+    dtype: aiSession.profile.textModelOptions?.dtype || GEMMA3N_TEXT_DTYPE_MAP,
+    modelKwargs,
+    localModelPath: "/models",
+    numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
+  }, 180000);
+
+  aiSession.activeSliceCount = requestedSlices;
+  state.browserRuntimeStatus = "ready";
+  state.browserRuntimeMessage = `Text-only local model · ${aiSession.profile.label} · num_slices=${requestedSlices} · ${runtimeLabelForSession(aiSession)} · self-test passed`;
+  state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
+  renderHeaderStatus();
 }
 
 async function assertLocalModelBundleReady(modelId) {
@@ -1945,6 +1987,7 @@ function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
     model: modelId,
     label: hasSlices ? `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}` : `${device === "webgpu" ? "WebGPU" : "WASM"}`,
     hasSlices,
+    maxSlices: baseProfile.maxSlices,
     sliceCount,
     maxInputTokens: hasSlices
       ? (device === "webgpu"
@@ -2981,7 +3024,13 @@ function basename(value) {
 }
 
 function runtimeLabelForSession(session) {
-  return session.profile?.device === "webgpu" ? "WebGPU" : "WASM";
+  const deviceLabel = session.profile?.device === "webgpu" ? "WebGPU" : "WASM";
+  if (!session.profile?.hasSlices) {
+    return deviceLabel;
+  }
+  const activeSlices = session.activeSliceCount || session.profile?.sliceCount || 1;
+  const maxSlices = session.profile?.maxSlices || state.browserProfile?.maxSlices || 36;
+  return `${deviceLabel} slice ${activeSlices}/${maxSlices}`;
 }
 
 function clampNumber(value, minimum, maximum) {

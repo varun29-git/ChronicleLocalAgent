@@ -4,6 +4,7 @@ let runtimePromise = null;
 let tokenizer = null;
 let model = null;
 let currentModelId = "";
+let currentInitKey = "";
 
 self.onmessage = async (event) => {
   const payload = event.data || {};
@@ -52,13 +53,15 @@ async function initializeWorkerModel(options) {
   if (!modelId) {
     throw new Error("Worker init missing model id.");
   }
-  if (tokenizer && model && currentModelId === modelId) {
+  const initKey = buildInitKey(options);
+  if (tokenizer && model && currentModelId === modelId && currentInitKey === initKey) {
     return;
   }
 
   tokenizer = null;
   model = null;
   currentModelId = "";
+  currentInitKey = "";
 
   const runtime = await loadRuntime(options.localModelPath, options.numThreads);
   const progress_callback = (progress) => {
@@ -73,6 +76,16 @@ async function initializeWorkerModel(options) {
     progress_callback,
   });
   currentModelId = modelId;
+  currentInitKey = initKey;
+}
+
+function buildInitKey(options) {
+  const device = String(options.device || "wasm");
+  const dtype = JSON.stringify(options.dtype || "q4f16");
+  const modelKwargs = JSON.stringify(
+    options.modelKwargs && typeof options.modelKwargs === "object" ? options.modelKwargs : {}
+  );
+  return `${String(options.model || "")}::${device}::${dtype}::${modelKwargs}`;
 }
 
 async function generateText(options) {
