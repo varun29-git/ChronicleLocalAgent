@@ -4,7 +4,7 @@
  */
 
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
-const MODEL_ID = "XformAI-india/qwen-0.6b-reasoning";
+const MODEL_ID = "onnx-community/Qwen3-0.6B-ONNX";
 
 let generatorPipeline = null;
 let currentProfile = null;

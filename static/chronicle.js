@@ -1,7 +1,7 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const MODEL_CANDIDATES = [
-  "XformAI-india/qwen-0.6b-reasoning",
+  "onnx-community/Qwen3-0.6B-ONNX",
 ];
 
 const GEMMA3N_DTYPE_MAP = {
@@ -1619,9 +1619,21 @@ async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) 
   state.browserRuntimeMessage = `Local model text runtime · ${candidate.label}`;
   state.browserRuntimeProgressText = "Opening text tokenizer…";
   renderHeaderStatus();
-  const tokenizer = await runtime.AutoTokenizer.from_pretrained(candidate.model, {
-    progress_callback: progressCallback,
-  });
+  await assertLocalModelBundleReady(candidate.model);
+  let tokenizer;
+  try {
+    tokenizer = await runtime.AutoTokenizer.from_pretrained(candidate.model, {
+      progress_callback: progressCallback,
+    });
+  } catch (error) {
+    const message = String(error?.message || error || "");
+    if (message.includes("tokenizer_class")) {
+      throw new Error(
+        `Local model bundle for "${candidate.model}" is missing tokenizer metadata. Ensure /models/${candidate.model} contains a valid config/tokenizer for Transformers.js.`
+      );
+    }
+    throw error;
+  }
   if (typeof tokenizer.apply_chat_template !== "function") {
     throw new Error("Text tokenizer does not expose chat templates for the selected local model.");
   }
@@ -1636,6 +1648,21 @@ async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) 
     model,
     profile: candidate,
   };
+}
+
+async function assertLocalModelBundleReady(modelId) {
+  const configPath = `/models/${modelId}/config.json`;
+  const tokenizerConfigPath = `/models/${modelId}/tokenizer_config.json`;
+  const [configRes, tokenizerRes] = await Promise.all([
+    fetch(configPath, { cache: "no-store" }),
+    fetch(tokenizerConfigPath, { cache: "no-store" }),
+  ]);
+
+  if (!configRes.ok || !tokenizerRes.ok) {
+    throw new Error(
+      `Local model files not found for "${modelId}". Expected files under /models/${modelId}/ (including config.json and tokenizer_config.json).`
+    );
+  }
 }
 
 async function loadTransformersRuntime() {

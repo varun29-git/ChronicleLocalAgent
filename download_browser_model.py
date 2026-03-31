@@ -59,6 +59,12 @@ AUXILIARY_COMPONENTS = {
     "audio_encoder": ("q4f16", "q4", "int8", "uint8", "quantized", "fp16", "fp32"),
     "vision_encoder": ("uint8", "int8", "quantized", "fp16", "fp32"),
 }
+GENERIC_ONNX_BASES = {
+    "q4": ("onnx/model_q4.onnx",),
+    "q4f16": ("onnx/model_q4f16.onnx",),
+    "quantized": ("onnx/model_quantized.onnx", "onnx/model_int8.onnx", "onnx/model_uint8.onnx"),
+    "default": ("onnx/model.onnx", "onnx/model_fp16.onnx"),
+}
 
 
 def main():
@@ -102,7 +108,7 @@ def build_allow_patterns(repo_files, requested_precision):
     repo_file_set = set(repo_files)
     allow_patterns = [file_name for file_name in CORE_ROOT_FILES if file_name in repo_file_set]
 
-    selected_precision = requested_precision
+    selected_precision = None
     candidate_order = []
     if requested_precision:
         candidate_order.append(requested_precision)
@@ -118,6 +124,14 @@ def build_allow_patterns(repo_files, requested_precision):
             selected_precision = precision_name
             allow_patterns.extend(matched_files)
             break
+
+    if not selected_precision:
+        for precision_name in candidate_order:
+            matched_files = collect_generic_precision_files(repo_files, precision_name)
+            if matched_files:
+                selected_precision = precision_name
+                allow_patterns.extend(matched_files)
+                break
 
     if not selected_precision:
         raise SystemExit("No supported ONNX precision set was found in the repo.")
@@ -156,6 +170,23 @@ def collect_component_files(repo_files, component_name, precision_order):
         else:
             base_file = f"onnx/{component_name}_{precision}.onnx"
 
+        matched_files = [
+            file_name
+            for file_name in repo_files
+            if file_name == base_file or file_name.startswith(f"{base_file}_")
+        ]
+        if matched_files:
+            return sorted(dict.fromkeys(matched_files))
+
+    return []
+
+
+def collect_generic_precision_files(repo_files, precision_name):
+    bases = GENERIC_ONNX_BASES.get(precision_name, ())
+    if not bases:
+        return []
+
+    for base_file in bases:
         matched_files = [
             file_name
             for file_name in repo_files
