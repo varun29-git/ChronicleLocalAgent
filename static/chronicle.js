@@ -171,7 +171,7 @@ function renderHeaderStatus() {
   }
 
   if (state.browserRuntimeStatus === "ready") {
-    setStatusPill("Gemma 3n ready");
+    setStatusPill("Model ready");
     elements.statusCopy.textContent = state.browserRuntimeMessage;
     return;
   }
@@ -188,8 +188,8 @@ function renderHeaderStatus() {
     return;
   }
 
-  setStatusPill("Preparing Gemma 3n", "is-warm");
-  elements.statusCopy.textContent = state.browserRuntimeMessage || `Preparing Gemma 3n in ${runtimeLabel}.`;
+  setStatusPill("Preparing model", "is-warm");
+  elements.statusCopy.textContent = state.browserRuntimeMessage || `Preparing model in ${runtimeLabel}.`;
 }
 
 function startNewTurn(userPrompt) {
@@ -1572,7 +1572,7 @@ async function ensureBrowserSession() {
     .then((session) => {
       state.browserSession = session;
       state.browserRuntimeStatus = "ready";
-      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} Gemma 3n · ${session.profile.label} · num_slices=${session.profile.sliceCount} · ${runtimeLabelForSession(session)}`;
+      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model · ${session.profile.label} · num_slices=${session.profile.sliceCount} · ${runtimeLabelForSession(session)}`;
       state.browserRuntimeProgress = 1;
       state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
       renderHeaderStatus();
@@ -1623,7 +1623,7 @@ async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) 
     progress_callback: progressCallback,
   });
   if (typeof tokenizer.apply_chat_template !== "function") {
-    throw new Error("Text tokenizer does not expose chat templates for Gemma 3n.");
+    throw new Error("Text tokenizer does not expose chat templates for the selected local model.");
   }
   const model = await runtime.AutoModelForCausalLM.from_pretrained(candidate.model, {
     ...candidate.textModelOptions,
@@ -1833,7 +1833,7 @@ async function waitForBrowserSessionReady() {
     }
 
     if (Date.now() >= deadline) {
-      throw new Error("Gemma 3n is taking too long to load on this device. Keep the tab open a little longer, then retry.");
+      throw new Error("The model is taking too long to load on this device. Keep the tab open a little longer, then retry.");
     }
 
     advanceWarmupTailProgress();
@@ -1852,7 +1852,7 @@ function beginBrowserLoad(candidate) {
   state.browserLoadStartedAt = Date.now();
   state.browserRuntimeStatus = "warming";
   state.browserRuntimeProgress = 0.06;
-  state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
+  state.browserRuntimeMessage = `Local model · ${candidate.label}`;
   state.browserRuntimeProgressText = "Preparing model files…";
   renderHeaderStatus();
 }
@@ -1882,7 +1882,7 @@ function updateBrowserLoadProgress(candidate, progressInfo = {}) {
 
   state.browserRuntimeStatus = "warming";
   state.browserRuntimeProgress = clampNumber(0.08 + average * 0.88, 0.06, 0.98);
-  state.browserRuntimeMessage = `Local Gemma 3n · ${candidate.label}`;
+  state.browserRuntimeMessage = `Local model · ${candidate.label}`;
   const etaText = estimateEtaFromProgress(state.browserLoadStartedAt, state.browserRuntimeProgress);
   state.browserRuntimeProgressText = `${Math.round(state.browserRuntimeProgress * 100)}% · ${describeLoadProgress(progressInfo)}${etaText ? ` · ETA ${etaText}` : ""}`;
   renderHeaderStatus();
