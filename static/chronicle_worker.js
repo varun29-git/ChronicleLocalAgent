@@ -38,9 +38,9 @@ async function loadRuntime(localModelPath, numThreads) {
       runtime.env.allowRemoteModels = false;
       runtime.env.allowLocalModels = true;
       runtime.env.localModelPath = localModelPath || "/models";
-      runtime.env.useBrowserCache = true;
+      runtime.env.useBrowserCache = false;
       if (runtime.env.backends?.onnx?.wasm) {
-        runtime.env.backends.onnx.wasm.numThreads = Math.min(4, Number(numThreads || 2));
+        runtime.env.backends.onnx.wasm.numThreads = Math.min(2, Number(numThreads || 2));
       }
       return runtime;
     });

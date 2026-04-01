@@ -237,64 +237,79 @@ async function runBrowserPipeline(payload) {
     selectedSummaries: [],
     finalNewsletter: null,
   };
-  const sessionPromise = ensureBrowserSession().catch((error) => {
-    console.warn("[Chronicle] Background model warmup failed during first issue.", error);
-    return null;
-  });
 
   state.activeStageKey = "query";
-  updateTurnStatus("Preparing search queries");
-  setStageState("query", "active", "Fast path");
-  run.queryPlan = buildFallbackQueryPlan(payload.brief, config.queryCount);
+  updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
+  setStageState("query", "active", getWarmupProgressLabel());
+  const aiSession = await waitForBrowserSessionReady();
+
+  updateTurnStatus("Generating search queries");
+  run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
   run.searchStartedAt = performance.now();
-  setStageState("search", "active", "Fast local evidence");
-  updateTurnStatus("Preparing local evidence");
-  run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
+  setStageState("search", "active", "Connecting to Google");
+  updateTurnStatus("Fetching Google results");
+  run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
+  if (!run.rawResults.length) {
+    appendSystemMessage("Google returned no readable results. Chronicle will continue using synthetic placeholder evidence.");
+    run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
+  }
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
 
   state.activeStageKey = "summarize";
   const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
   run.summarizeStartedAt = performance.now();
   setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
-  updateTurnStatus("Preparing evidence");
+  updateTurnStatus("Summarizing results");
   for (let index = 0; index < prioritizedRawResults.length; index += 1) {
     const result = prioritizedRawResults[index];
-    const summary = buildFallbackResultSummary(result);
+    const summary = await summarizeSearchResult(aiSession, result);
     run.resultSummaries.push(summary);
     const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
     const etaText = estimateLoopEta(run.summarizeStartedAt, index + 1, prioritizedRawResults.length);
     setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
-    updateTurnStatus(`Preparing evidence (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
+    updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
+  }
+  let modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+  if (modelSummaryCount === 0 && aiSession.runtimeKind === "worker") {
+    updateTurnStatus("Summary pass was slow. Retrying once with longer generation timeouts.");
+    setStageState("summarize", "active", `Retry 0/${prioritizedRawResults.length} summarized`);
+    const retrySummaries = [];
+    const retryStartedAt = performance.now();
+    for (let index = 0; index < prioritizedRawResults.length; index += 1) {
+      const result = prioritizedRawResults[index];
+      const summary = await summarizeSearchResult(aiSession, result, { longTimeout: true });
+      retrySummaries.push(summary);
+      const progressText = `Retry ${index + 1}/${prioritizedRawResults.length} summarized`;
+      const etaText = estimateLoopEta(retryStartedAt, index + 1, prioritizedRawResults.length);
+      setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
+      updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
+    }
+    run.resultSummaries = retrySummaries;
+    modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
   }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
+  if (modelSummaryCount === 0) {
+    const failureReasons = uniqueStrings(
+      run.resultSummaries
+        .map((summary) => cleanText(summary.model_error || ""))
+        .filter(Boolean)
+    );
+    const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
+    console.warn(
+      `[Chronicle] Model produced 0/${run.resultSummaries.length} direct summaries.${reasonText}`
+    );
+    appendSystemMessage("Chronicle could not get direct model summaries on this pass, so it used safe deterministic summaries to complete the issue.");
+  }
   run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
 
   state.activeStageKey = "newsletter";
   setStageState("newsletter", "active", "Writing issue");
   updateTurnStatus("Generating newsletter");
   run.newsletterStartedAt = performance.now();
-  const aiSession = await Promise.race([sessionPromise, sleep(1500).then(() => null)]);
-  if (aiSession) {
-    run.finalNewsletter = await generateNewsletter(aiSession, run);
-  } else {
-    const frame = buildFallbackNewsletterFrame(run);
-    const markdown = finalizeNewsletterMarkdown(buildEmergencyNewsletterMarkdown(run, frame), run);
-    const title = extractTitleFromMarkdown(markdown, run.queryPlan.title);
-    const storageKey = `chronicle::issue::${slugify(title)}::${Date.now()}`;
-    const htmlDocument = renderEditableIssueHtml(title, markdown, storageKey);
-    run.writeTimings = { totalMs: Math.round(performance.now() - run.newsletterStartedAt) };
-    run.finalNewsletter = {
-      title,
-      markdown,
-      htmlDocument,
-      storageKey,
-      downloadName: `${slugify(title)}-editable.html`,
-    };
-    appendSystemMessage("Chronicle used the fast first-issue path while the local model continues warming in the background.");
-  }
+  run.finalNewsletter = await generateNewsletter(aiSession, run);
   const stage4Seconds = Math.max(1, Math.round((run.writeTimings?.totalMs || 0) / 1000));
   setStageState("newsletter", "complete", `Draft complete (${stage4Seconds}s)`);
 
@@ -1774,10 +1789,10 @@ async function loadTransformersRuntime() {
       runtime.env.allowRemoteModels = false;
       runtime.env.allowLocalModels = true;
       runtime.env.localModelPath = "/models";
-      runtime.env.useBrowserCache = true;
+      runtime.env.useBrowserCache = false;
 
       if (runtime.env.backends?.onnx?.wasm) {
-        runtime.env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+        runtime.env.backends.onnx.wasm.numThreads = Math.min(2, navigator.hardwareConcurrency || 2);
       }
 
       return runtime;

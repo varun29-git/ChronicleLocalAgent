@@ -105,6 +105,8 @@ class ChronicleStaticHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", guessed_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", cache_header)
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.end_headers()
         if send_body:
             self.wfile.write(content)
@@ -159,6 +161,8 @@ class ChronicleStaticHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.end_headers()
         if send_body:
             self.wfile.write(body)
@@ -169,6 +173,8 @@ class ChronicleStaticHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.end_headers()
         if send_body:
             self.wfile.write(body)
